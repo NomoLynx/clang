@@ -1,0 +1,30 @@
+# find address token item
+
+this document define a pattern to address token item.
+
+## struct name
+
+- FindAddressTakenItem
+
+this is the name of the struct will be visible to invoker.
+
+## pattern nodes definition
+
+| node_name | definition | is_output |
+| --- | --- | --- |
+| expr | is_expression | |
+| id | is_atom_item_id | y |
+| expr_prefix | is_expression_prefix_addressing | |
+
+## mermaid display
+
+```mermaid
+---
+title: find address token item
+---
+
+flowchart TB
+    expr_prefix -.1.-> expr
+    expr -.1.-> id
+
+```

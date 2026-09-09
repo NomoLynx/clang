@@ -1,0 +1,51 @@
+# expr post ref
+
+this document define a pattern to match the expr post ref.
+
+## struct name
+
+- ExprPostfixRefLogic
+
+this is the name of the struct will be visible to invoker.
+
+## pattern nodes definition
+
+| node_name | definition | is_output | is_output2 |
+| --- | --- | --- | -- |
+| expr_post2 | is_expr_post | y | |
+| expr | is_expression | | y |
+| postfix_expr_part | is_postfix_expression_part | y | y |
+| expr_post | is_expr_post | | |
+| atom | is_atom | | |
+| id | is_atom_item_id | | |
+
+## mermaid display
+
+this is the 1st match case
+
+```mermaid
+---
+title: expression postfix under expression
+---
+
+flowchart TB
+    expr_post --> expr
+    expr_post --> postfix_expr_part
+    expr --> expr_post2
+
+```
+
+this is the 2nd case
+
+```mermaid
+---
+title: expression and post_expr_part
+---
+
+flowchart TB
+    expr_post --> expr
+    expr_post --> postfix_expr_part
+    expr --> atom
+    atom --> id
+
+```

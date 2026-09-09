@@ -1,0 +1,7 @@
+{
+    "full_path": "",
+    "output_folder": "./test_clang",
+    "is_print_debug": false,
+    "is_build_to_lib": false,
+    "stack_space_size": null
+}

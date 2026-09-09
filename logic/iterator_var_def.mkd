@@ -1,0 +1,34 @@
+# iterator var def
+
+this document define a pattern to match the iterator var def definition.
+
+## struct name
+
+- IterationFor
+
+this is the name of the struct will be visible to invoker.
+
+## pattern nodes definition
+
+| node_name | definition | is_output |
+| --- | --- | --- |
+| id | is_atom_item_id | y |
+| type_specifier_node | is_typespecifier | y |
+| expr_node | is_expression_statement | y |
+| for_node | is_for_loop | |
+| assignment_statement | is_assignment_expression | |
+
+## mermaid display
+
+```mermaid
+---
+title: iterator var def
+---
+
+flowchart TB
+    for_node --> expr_node
+    expr_node --> type_specifier_node
+    expr_node --> assignment_statement
+    assignment_statement -..-> id
+
+```
