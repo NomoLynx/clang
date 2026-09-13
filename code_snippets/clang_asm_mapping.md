@@ -609,7 +609,7 @@ template for var0++
 ```asm
     .text 
     __label_inc_template:
-    addi t1, t1, 1
+    addi t1, t1, 144
     sw t1, 0(t0)
 ```
 
@@ -623,7 +623,7 @@ template for var0++
 ```asm
     .text 
     __label_inc_no_save_template:
-    addi t1, t1, 1
+    addi t1, t1, 144
 ```
 
 ## desc
@@ -636,7 +636,7 @@ template for var0--
 ```asm
     .text 
     __label_inc_template:
-    addi t1, t1, -1
+    addi t1, t1, 144
     sw t1, 0(t0)
 ```
 
@@ -650,7 +650,7 @@ template for var0-- and the value is stored in register
 ```asm
     .text 
     __label_inc_no_save_template:
-    addi t1, t1, -1
+    addi t1, t1, 144
 ```
 
 ## bitwise_not

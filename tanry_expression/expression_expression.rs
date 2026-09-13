@@ -36,13 +36,42 @@ impl Expression_Expression {
         }
         
         match self.op {
-            LangOperators::Add |
-            LangOperators::Sub |
             LangOperators::Mul |
             LangOperators::Div |
             LangOperators::Rem |
             LangOperators::Pow => {
                 self.left.get_clang_type()
+            }
+            LangOperators::Add => {
+                let left_type = self.left.get_clang_type();
+                let right_type = self.right.get_clang_type();
+
+                if left_type.is_pointer() {
+                    left_type
+                }
+                else if right_type.is_pointer() {
+                    right_type
+                }
+                else {
+                    left_type
+                }
+            }
+            LangOperators::Sub => {
+                let left_type = self.left.get_clang_type();
+                let right_type = self.right.get_clang_type();
+
+                if left_type.is_pointer() && right_type.is_pointer() {
+                    CLangTypes::Int32
+                }
+                else if left_type.is_pointer() {
+                    left_type
+                }
+                else if right_type.is_pointer() {
+                    right_type
+                }
+                else {
+                    left_type
+                }
             }
             LangOperators::LogicEqual |
             LangOperators::NotEqual |

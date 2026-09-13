@@ -210,6 +210,20 @@ fn generate_md_type_str(md_str:&str, type_name:&str, var_name:&str) -> String {
           .replace(&format!("Type_{type_name}"), var_name)
 }
 
+fn get_inc_dec_step_size(expr:&Expression, ast_item:&ASTItem, context:&CodeGenContext) -> usize {
+    let expr_type = resolve_clang_type_for_usage(&expr.get_clang_type(), ast_item);
+    if expr_type.is_pointer() {
+        expr_type
+            .dereference_pointer_type(1)
+            .and_then(|ty| ty.get_type_size_in_bytes(context))
+            .filter(|n| *n > 0)
+            .unwrap_or(1)
+    }
+    else {
+        1
+    }
+}
+
 /// code generation for each node
 pub trait AsmCodeGenTrait {
     fn generate_code(&self, context:&mut CodeGenContext) -> Result<(), CLangError>;
@@ -1120,6 +1134,10 @@ impl AsmCodeGenTrait for Expression {
                     LangOperators::Mul | 
                     LangOperators::Sub |
                     LangOperators::Div => {
+                        let is_pointer_pointer_sub = op == &LangOperators::Sub && m_type.is_pointer() && n_type.is_pointer();
+                        let is_pointer_numeric_add_sub =
+                            (op.is_add_or_sub() && m_type.is_pointer() && n_type.is_numeric_type()) ||
+                            (op == &LangOperators::Add && n_type.is_pointer() && m_type.is_numeric_type());
                         let asm_op = hash[&op.to_string()].to_string();
                         m.generate_code(context)?;
                         let mut a = context.get_code_snippet().clone();
@@ -1127,6 +1145,110 @@ impl AsmCodeGenTrait for Expression {
                         let mut b = context.get_code_snippet().clone();
                         context.append_conversion_code(&mut a, m_conv)?;
                         context.append_conversion_code(&mut b, n_conv)?;
+
+                        if is_pointer_numeric_add_sub {
+                            let pointer_base_type = if m_type.is_pointer() {
+                                m_type.dereference_pointer_type(1).unwrap_or(CLangTypes::Invalid)
+                            }
+                            else {
+                                n_type.dereference_pointer_type(1).unwrap_or(CLangTypes::Invalid)
+                            };
+
+                            let element_size = pointer_base_type.get_type_size_in_bytes(context).unwrap_or(1);
+                            if element_size > 1 {
+                                if m_type.is_pointer() {
+                                    let from_reg = b
+                                        .get_output_register_names()
+                                        .first()
+                                        .ok_or_else(|| CLangError::cannot_emit("cannot find output register for pointer-offset scaling"))?
+                                        .to_string();
+                                    let blocked_regs = b.get_contaminated_registers().get_register_alias_name();
+                                    let to_temp_reg = context.get_available_register_as_registerset()
+                                        .get_temp_registers()
+                                        .get_register_alias_name()
+                                        .into_iter()
+                                        .find(|reg| reg != &from_reg && reg != "t1" && !blocked_regs.contains(reg))
+                                        .ok_or_else(|| CLangError::cannot_emit("cannot find free temp register to preserve pointer offset operand"))?;
+
+                                    let move_reg_code = context.new_move_register_snippet(
+                                        &SnippetKey::default(),
+                                        ast_item,
+                                        &from_reg,
+                                        &to_temp_reg,
+                                    )?;
+
+                                    let mut scale_offset_code = context.get_code_with_debug(
+                                        "mul_const",
+                                        &format!("scale pointer offset by element size {element_size}"),
+                                        ast_item,
+                                    )?;
+                                    scale_offset_code.replace_imm(&element_size.to_string());
+                                    scale_offset_code.move_register_from(
+                                        move_reg_code.get_impacted_regs_as_registerset() + move_reg_code.get_output_register_as_registerset(),
+                                        [].into(),
+                                        context,
+                                    )?;
+                                    scale_offset_code.get_input_register_from(0, &move_reg_code, 0, context)?;
+                                    let scaled_reg = scale_offset_code
+                                        .get_input_register_names()
+                                        .first()
+                                        .unwrap()
+                                        .to_string();
+                                    scale_offset_code.move_temp_register(context)?;
+                                    scale_offset_code.set_output_register(&scaled_reg);
+
+                                    b.add_snippet(move_reg_code);
+                                    b.add_snippet(scale_offset_code);
+                                    b.set_output_register_names(vec![to_temp_reg]);
+                                }
+                                else {
+                                    let from_reg = a
+                                        .get_output_register_names()
+                                        .first()
+                                        .ok_or_else(|| CLangError::cannot_emit("cannot find output register for pointer-offset scaling"))?
+                                        .to_string();
+                                    let blocked_regs = a.get_contaminated_registers().get_register_alias_name();
+                                    let to_temp_reg = context.get_available_register_as_registerset()
+                                        .get_temp_registers()
+                                        .get_register_alias_name()
+                                        .into_iter()
+                                        .find(|reg| reg != &from_reg && reg != "t1" && !blocked_regs.contains(reg))
+                                        .ok_or_else(|| CLangError::cannot_emit("cannot find free temp register to preserve pointer offset operand"))?;
+
+                                    let move_reg_code = context.new_move_register_snippet(
+                                        &SnippetKey::default(),
+                                        ast_item,
+                                        &from_reg,
+                                        &to_temp_reg,
+                                    )?;
+
+                                    let mut scale_offset_code = context.get_code_with_debug(
+                                        "mul_const",
+                                        &format!("scale pointer offset by element size {element_size}"),
+                                        ast_item,
+                                    )?;
+                                    scale_offset_code.replace_imm(&element_size.to_string());
+                                    scale_offset_code.move_register_from(
+                                        move_reg_code.get_impacted_regs_as_registerset() + move_reg_code.get_output_register_as_registerset(),
+                                        [].into(),
+                                        context,
+                                    )?;
+                                    scale_offset_code.get_input_register_from(0, &move_reg_code, 0, context)?;
+                                    let scaled_reg = scale_offset_code
+                                        .get_input_register_names()
+                                        .first()
+                                        .unwrap()
+                                        .to_string();
+                                    scale_offset_code.move_temp_register(context)?;
+                                    scale_offset_code.set_output_register(&scaled_reg);
+
+                                    a.add_snippet(move_reg_code);
+                                    a.add_snippet(scale_offset_code);
+                                    a.set_output_register_names(vec![to_temp_reg]);
+                                }
+                            }
+                        }
+
                         b.move_register_from(a.get_output_register_as_registerset(), [].into(), context)?;
 
                         // use add template and then replace the instruction with other operator
@@ -1134,7 +1256,46 @@ impl AsmCodeGenTrait for Expression {
                         r.get_input_registers_from(vec![&a, &b], context)?;
                         let label_str = r.get_all_labels().last().unwrap().clone();
                         r.insert_after_label_bulk(vec![(label_str.clone(), a), (label_str.clone(), b)], context)?;
-                        context.set_code_snippet(r.clone());
+
+                        // C pointer subtraction returns element distance, not raw byte distance.
+                        if is_pointer_pointer_sub {
+                            let pointer_base_type = m_type
+                                .dereference_pointer_type(1)
+                                .unwrap_or(CLangTypes::Invalid);
+                            let element_size = pointer_base_type
+                                .get_type_size_in_bytes(context)
+                                .unwrap_or(1);
+
+                            if element_size > 1 {
+                                let mut scale_code = context.get_code_with_debug(
+                                    "load_const_to_a0",
+                                    &format!("load pointer-diff element size {element_size}"),
+                                    ast_item,
+                                )?;
+                                scale_code.replace_imm(&element_size.to_string());
+
+                                let mut normalize = context.get_code_with_debug2(
+                                    &snippet_key,
+                                    "div",
+                                    "normalize pointer difference by element size",
+                                    ast_item,
+                                )?;
+                                normalize.get_input_registers_from(vec![&r, &scale_code], context)?;
+                                let normalize_label = normalize.get_all_labels().last().unwrap().clone();
+                                normalize.insert_after_label_bulk(
+                                    vec![(normalize_label.clone(), r), (normalize_label, scale_code)],
+                                    context,
+                                )?;
+                                context.set_code_snippet(normalize);
+                            }
+                            else {
+                                context.set_code_snippet(r.clone());
+                            }
+                        }
+                        else {
+                            context.set_code_snippet(r.clone());
+                        }
+
                         Ok(())
                     }
                     LangOperators::Less |
@@ -1260,14 +1421,11 @@ impl AsmCodeGenTrait for Expression {
                         return Ok(());
                     }
                     else if postfix.is_clangexpression() {
-                        // get the array type's code (the array is n.Expression)
-                        let (expr_clang, part) = get_postfix_ref_expr_and_names(n);
-
-                        let expr = expr_clang.get_expression().unwrap();
-
-                        // get the asm code get the array address
+                        // Use the already-built left expression as the base of this index step.
+                        // Re-deriving via postfix-ref logic can mismatch nested index levels
+                        // (e.g. matrix[i][j]) and bind the wrong index variable.
                         let mut array_code = context.with_const_expresion_on_left_value(true,
-                            |ctx| generate_dot_reference_code(expr, &part, ctx))?;
+                            |ctx| v.generate_code(ctx).map(|_| ctx.get_code_snippet().clone()))?;
 
                         // get the array access code 
                         let array_type = n.get_index_operand_type();
@@ -1310,6 +1468,8 @@ impl AsmCodeGenTrait for Expression {
 
                         let mut inc_code = context.get_code( "inc_no_save", ast_item)?;     // float cannot perform ++ or --, so no need to handle the float case here
                         inc_code.get_input_registers_from(vec![&const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        inc_code.replace_imm(&step.to_string());
                         inc_code.insert_at_beginning(vec![const_code]);
                         inc_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(inc_code);
@@ -1320,6 +1480,8 @@ impl AsmCodeGenTrait for Expression {
                         load_code.get_input_register_from(0, &const_code, 0, context)?;
                         let mut inc_code = context.get_code( "inc", ast_item)?;     // float cannot perform ++ or --, so no need to handle the float case here
                         inc_code.get_input_registers_from(vec![&load_code, &const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        inc_code.replace_imm(&step.to_string());
                         inc_code.insert_at_beginning(vec![const_code, load_code]);
                         inc_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(inc_code);
@@ -1332,6 +1494,8 @@ impl AsmCodeGenTrait for Expression {
 
                         let mut dec_code = context.get_code( "desc_no_save", ast_item)?;     // float cannot perform ++ or --, so no need to handle the float case here
                         dec_code.get_input_registers_from(vec![&const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        dec_code.replace_imm(&format!("-{step}"));
                         dec_code.insert_at_beginning(vec![const_code]);
                         dec_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(dec_code);
@@ -1342,6 +1506,8 @@ impl AsmCodeGenTrait for Expression {
                         load_code.get_input_register_from(0, &const_code, 0, context)?;
                         let mut dec_code = context.get_code( "desc", ast_item)?;     // float cannot perform ++ or --, so no need to handle the float case here
                         dec_code.get_input_registers_from(vec![&load_code, &const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        dec_code.replace_imm(&format!("-{step}"));
                         dec_code.insert_at_beginning(vec![const_code, load_code]);
                         dec_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(dec_code);
@@ -1402,6 +1568,8 @@ impl AsmCodeGenTrait for Expression {
 
                         let mut inc_code = context.get_code( "inc_no_save", ast_item)?;  // float cannot perform ++ or --, so no need to handle the float case here
                         inc_code.get_input_registers_from(vec![&const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        inc_code.replace_imm(&step.to_string());
                         inc_code.insert_at_beginning(vec![const_code]);
                         inc_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(inc_code);
@@ -1417,6 +1585,8 @@ impl AsmCodeGenTrait for Expression {
                         load_value_code.get_input_register_from(0, &const_code, 0, context)?;
                         let mut inc_code = context.get_code( "inc", ast_item)?;  // float cannot perform ++ or --, so no need to handle the float case here
                         inc_code.get_input_registers_from(vec![&load_value_code, &const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        inc_code.replace_imm(&step.to_string());
                         inc_code.insert_at_beginning(vec![const_code, load_value_code]);
                         inc_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(inc_code);
@@ -1434,6 +1604,8 @@ impl AsmCodeGenTrait for Expression {
 
                         let mut dec_code = context.get_code( "desc_no_save", ast_item)?;  // float cannot perform ++ or --, so no need to handle the float case here
                         dec_code.get_input_registers_from(vec![&const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        dec_code.replace_imm(&format!("-{step}"));
                         dec_code.insert_at_beginning(vec![const_code]);
                         dec_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(dec_code);
@@ -1449,6 +1621,8 @@ impl AsmCodeGenTrait for Expression {
                         load_value_code.get_input_register_from(0, &const_code, 0, context)?;
                         let mut dec_code = context.get_code( "desc", ast_item)?;  // float cannot perform ++ or --, so no need to handle the float case here
                         dec_code.get_input_registers_from(vec![&load_value_code, &const_code], context)?;
+                        let step = get_inc_dec_step_size(v, ast_item, context);
+                        dec_code.replace_imm(&format!("-{step}"));
                         dec_code.insert_at_beginning(vec![const_code, load_value_code]);
                         dec_code.set_debug_info(&format!("{self}"));
                         context.set_code_snippet(dec_code);
@@ -2066,7 +2240,15 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
 
     assert!(array_type.is_array());
     let (base_type, _name, dimensions) = array_type.get_array_type().unwrap();
-    assert!(assignments.len() == dimensions.get_dimension_count());
+    let provided_index_count = assignments.len();
+    let dimension_count = dimensions.get_dimension_count();
+    if provided_index_count > dimension_count {
+        return Err(CLangError::cannot_emit(
+            &format!(
+                "array indexing overflow: provided {provided_index_count} indexes for {dimension_count}D array"
+            )
+        ));
+    }
 
     // offset = 0
     let mut code = context.get_code_with_debug("zero_register", "array index zero reg", ast_item)?;
@@ -2086,6 +2268,39 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
         index_code.get_input_registers_from(vec![&code, &assignment_code], context)?;
         code.add_snippet(assignment_code);
         code.add_snippet(index_code);
+    }
+
+    // For partial indexing (e.g. matrix[1] for matrix[3][4]), keep the
+    // result as the base address of the remaining sub-array by scaling with
+    // the product of the still-unindexed dimensions.
+    let remaining_dim_product = dimensions
+        .get_dimensions_values()
+        .iter()
+        .skip(provided_index_count)
+        .product::<usize>();
+
+    if remaining_dim_product > 1 {
+        let mut remaining_scale_code = context.get_code_with_debug(
+            "mul_const",
+            &format!("scale index by remaining dimension product {remaining_dim_product}"),
+            ast_item,
+        )?;
+        remaining_scale_code.replace_imm(&remaining_dim_product.to_string());
+        remaining_scale_code.move_register_from(
+            code.get_impacted_regs_as_registerset() + code.get_output_register_as_registerset(),
+            [].into(),
+            context,
+        )?;
+        remaining_scale_code.get_input_register_from(0, &code, 0, context)?;
+        let scale_input_reg = remaining_scale_code
+            .get_input_register_names()
+            .first()
+            .unwrap()
+            .to_string();
+        remaining_scale_code.move_temp_register(context)?;
+        remaining_scale_code.set_output_register(&scale_input_reg);
+        code.set_output_register_names(vec![scale_input_reg]);
+        code.add_snippet(remaining_scale_code);
     }
 
     // offset *= base_type size
@@ -2122,7 +2337,8 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
     code.add_asm_inc("add", vec![Some(base_address_reg), Some(base_address_reg), Some(&output_reg)])?;
     code.set_output_register_names(vec![base_address_reg.to_string()]);
 
-    if !context.is_const_expresion_on_left() {
+    let is_full_indexed = provided_index_count == dimension_count;
+    if !context.is_const_expresion_on_left() && is_full_indexed {
         // load value from the final address
         let mut load_value_code = context.get_code_with_debug2(& base_type.into(), "load_address_to_reg", "load array value", ast_item)?;
         load_value_code.move_register_from(code.get_contaminated_registers(), base_address_reg.into(),  context)?;

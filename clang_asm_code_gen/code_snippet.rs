@@ -600,6 +600,8 @@ impl CodeSnippet {
             self.perform_registerset_action(n);
         }
 
+        let output_reg_aliases = self.get_output_register_as_registerset().get_register_alias_name();
+
         // if reg_to_push is not empty, then add push and pop instructions at beginning and end of the code snippet
         if !reg_to_push.is_empty() {
             let reg_names_str = reg_to_push.to_alias_vec().join(", ");
@@ -611,7 +613,7 @@ impl CodeSnippet {
             let mut pop_code = CodeSnippet::new_with_debug_info("pop float registers", format!("pop float registers to avoid conflict: [{reg_names_str}] => [{replacement_str}]").as_str());
             let mut regs_to_restore = Vec::new();
             for reg in reg_to_push.get_register_alias_name() {
-                let reg = replacements.iter()
+                let mapped_reg = replacements.iter()
                     .filter(|x| x.is_replace_action())
                     .find_map(|n| {
                         let (old, new) = n.to_tuple();
@@ -620,9 +622,22 @@ impl CodeSnippet {
                         if old_usage == reg_usage { Some(RegisterUsage::new(&new).get_reg_alias().to_string())}
                         else { None }
                     })
-                    .unwrap_or(reg);
-                push_code.add_asm_inc("pushf64", vec![Some(&reg)])?;
-                regs_to_restore.push(reg);
+                    .unwrap_or_else(|| reg.clone());
+
+                let reg_to_save = if output_reg_aliases.contains(&mapped_reg) {
+                    reg.clone()
+                }
+                else {
+                    mapped_reg
+                };
+
+                assert!(
+                    !output_reg_aliases.contains(&reg_to_save),
+                    "destination/output register must not be part of conflict save/restore set. output={output_reg_aliases:?}, spill={reg_to_save}, original={reg}, replacements={replacements:?}"
+                );
+
+                push_code.add_asm_inc("pushf64", vec![Some(&reg_to_save)])?;
+                regs_to_restore.push(reg_to_save);
             }
 
             // Stack restore must be reverse of save order (LIFO).
@@ -654,6 +669,8 @@ impl CodeSnippet {
             self.perform_registerset_action(n);
         }
 
+        let output_reg_aliases = self.get_output_register_as_registerset().get_register_alias_name();
+
         // if reg_to_push is not empty, then add push and pop instructions at beginning and end of the code snippet
         if !reg_to_push.is_empty() {
             let reg_names_str = reg_to_push.to_alias_vec().join(", ");
@@ -665,7 +682,7 @@ impl CodeSnippet {
             let mut pop_code = CodeSnippet::new_with_debug_info("pop int registers", format!("pop int registers to avoid conflict: [{reg_names_str}] => [{replacement_str}]").as_str());
             let mut regs_to_restore = Vec::new();
             for reg in reg_to_push.get_register_alias_name() {
-                let reg = replacements.iter()
+                let mapped_reg = replacements.iter()
                     .filter(|x| x.is_replace_action())
                     .find_map(|n| {
                         let (old, new) = n.to_tuple();
@@ -674,9 +691,22 @@ impl CodeSnippet {
                         if old_usage == reg_usage { Some(RegisterUsage::new(&new).get_reg_alias().to_string())}
                         else { None }
                     })
-                    .unwrap_or(reg);
-                push_code.add_asm_inc("push64", vec![Some(&reg)])?;
-                regs_to_restore.push(reg);
+                    .unwrap_or_else(|| reg.clone());
+
+                let reg_to_save = if output_reg_aliases.contains(&mapped_reg) {
+                    reg.clone()
+                }
+                else {
+                    mapped_reg
+                };
+
+                assert!(
+                    !output_reg_aliases.contains(&reg_to_save),
+                    "destination/output register must not be part of conflict save/restore set. output={output_reg_aliases:?}, spill={reg_to_save}, original={reg}, replacements={replacements:?}"
+                );
+
+                push_code.add_asm_inc("push64", vec![Some(&reg_to_save)])?;
+                regs_to_restore.push(reg_to_save);
             }
 
             // Stack restore must be reverse of save order (LIFO).

@@ -9,6 +9,7 @@ use rust_macro::*;
 use pest::iterators::Pair;
 
 use crate::languages::clang::clang_asm_code_gen::CodeGenContext;
+use crate::languages::clang::constant_expression::{CastExpression, ConstantExpression};
 use crate::languages::clang::logic::get_postfix_ref;
 use crate::languages::clang::post_operator::*;
 use crate::languages::clang::clang_pest::{Rule, UnaryOperator};
@@ -34,6 +35,32 @@ pub enum Expression {
 }
 
 impl Expression {
+
+    fn from_constant_expression_for_primary(const_expr: ConstantExpression) -> Option<Self> {
+        match const_expr {
+            ConstantExpression::Tanry(_, tanry_expr) => {
+                let mut expr = tanry_expr.get_tanry_expression().get_expression().clone();
+                for postfix_part in tanry_expr.get_postfix_expression_parts().iter() {
+                    expr = Expression::Postfix(
+                        postfix_part.get_ast_item().clone(),
+                        Expression_Postfix::new(
+                            Box::new(expr),
+                            PostOperator::PostfixExpressionPart(postfix_part.clone()),
+                        ),
+                    );
+                }
+
+                Some(expr)
+            }
+            ConstantExpression::Cast(_, cast_expr) => {
+                let cast_type = cast_expr.get_clang_type();
+                let mut expr = Self::from_constant_expression_for_primary(cast_expr.get_constant_expr().clone())?;
+                expr.get_ast_item_mut().set_runtime_type(cast_type);
+                Some(expr)
+            }
+            ConstantExpression::Sizeof(_, _) => None,
+        }
+    }
 
     /// create a new pratt parser for expression which contains order of the operators
     fn new_pratt() -> PrattParser<Rule> {
@@ -64,6 +91,14 @@ impl Expression {
                 Rule::single_character |
                 Rule::string |
                 Rule::integer => Expression::Atom(ast_item, Atom::from_pair(&pair, *context.borrow_mut()).unwrap()),
+                Rule::cast_expression => {
+                    let cast_expr = CastExpression::from_pair(&pair, *context.borrow_mut()).unwrap();
+                    let cast_type = cast_expr.get_clang_type();
+                    let mut expr = Self::from_constant_expression_for_primary(cast_expr.get_constant_expr().clone())
+                        .unwrap_or_else(|| panic!("cannot convert cast_expression primary '{}' to expression", pair.as_str()));
+                    expr.get_ast_item_mut().set_runtime_type(cast_type);
+                    expr
+                }
                 Rule::identifier => {
                     let atom_ast_item = ast_item.clone();
                     let atom_item_ast_item = ast_item.clone();

@@ -1,4 +1,4 @@
-use crate::languages::clang::{assignment_expression::AssignmentExpressionLeftPart, clang_types::CLangTypes, constant_expression::{CastExpression, ConstantExpression, ConstantExpression_Tanry, SizeOfExpression}, symbol_table::SymbolTable, traits::ASTItemTrait};
+use crate::languages::clang::{assignment_expression::AssignmentExpressionLeftPart, clang_types::CLangTypes, constant_expression::{CastExpression, ConstantExpression, ConstantExpression_Tanry, SizeOfExpression}, traits::ASTItemTrait};
 use crate::languages::clang::tanry_expression::*;
 use crate::languages::clang::tanry_expression::expression_postfix::*;
 

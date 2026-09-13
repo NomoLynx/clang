@@ -362,6 +362,7 @@ unary_op = { plusplus | minusminus | subtraction | logic_not | bit_not | bit_and
 post_op = { plusplus | minusminus } 
 atom = _{
     unary_op? ~ (
+  cast_expression |
       bool_value | integer | float | identifier | single_character |
       string |
       "(" ~ tenary_expression ~ ")" |
