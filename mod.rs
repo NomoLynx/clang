@@ -3,7 +3,8 @@ use clang_pest::parse_clang;
 use traits::display_diagram_trait::StateDiagramDisplay;
 
 use core_utils::debug::*;
-use crate::languages::{clang::{clang_solution::CLangSolution, sematic_linkage::SemanticLinkage, traits::{symbol_table::AccessSymbolTableTrait, to_markdown_table_row_trait::ToMarkdownTableRow}}, r5asm::assembler::build_asm_solution};
+use crate::languages::r5asm::assembler::build_asm_solution;
+use crate::languages::{clang::{clang_solution::CLangSolution, sematic_linkage::SemanticLinkage, traits::{symbol_table::AccessSymbolTableTrait, to_markdown_table_row_trait::ToMarkdownTableRow}}};
 use crate::languages::clang::clang_asm_code_gen::*;
 use crate::languages::clang::traits::*;
 use core_utils::filesystem::*;
