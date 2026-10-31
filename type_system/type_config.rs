@@ -175,9 +175,6 @@ impl TypeConfiguration {
                 let expr_postfix = CLangItem::from_raw(n);
                 let clang_type = expr_postfix.get_clang_type();
                 if !(clang_type.is_none_type() || clang_type.is_invalid_type()) {
-                    debug_string(format!("Expression_Postfix: '{}', inferred type: '{}'", 
-                                expr_postfix.get_name(), 
-                                clang_type.to_string()));
                     expr_postfix.set_clang_type(clang_type);
                 } else {
                     context.add_error_node(clang_item,
