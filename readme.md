@@ -2,6 +2,8 @@
 
 This directory contains the project’s C-language compiler implementation for the CLR toolchain. The compiler is implemented in Rust and is designed to parse a C-like source program, analyze its types and symbols, resolve semantic links, and emit RISC-V assembly that can then be assembled into a binary.
 
+More code and components will be gradually migrated from our local development server to this GitHub repository.
+
 ## Purpose
 
 The compiler pipeline is centered around `CLangProgram` and the build entry point in `mod.rs`:
