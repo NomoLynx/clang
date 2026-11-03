@@ -10,7 +10,6 @@ pub mod expr_post_ref;
 pub use duplication_check::*;
 pub use find_address_taken_item::*;
 pub use address_dot_ids::*;
-pub use iterator_var_def::*;
 pub use decl_facts::*;
 pub use fn_invoke::*;
 pub use expr_post_ref::*;
