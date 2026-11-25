@@ -184,6 +184,7 @@ pub struct Declaration {
     clang_type: CLangTypes,  //struct, union, and enum types can be here.
     is_extern : bool,
     is_typedef : bool,
+    has_type_qualifiers : bool,
     init_declarator_list: Vec<InitDeclarator>,
     ast_item : ASTItem
 }
@@ -213,6 +214,9 @@ impl Declaration {
         // check if types has extern and get its index
         declaration.is_extern = types.iter().any(|x| x.is_extern());
         declaration.is_typedef = types.iter().any(|x| x.is_typedef());
+        declaration.has_type_qualifiers = types.iter().any(|x| {
+            matches!(x, TypeSpecifier::Const(_) | TypeSpecifier::Volatile(_))
+        });
 
         //parse the rule:init_declarator_list if exists
         if inner_pairs.len() == 2 {
@@ -350,6 +354,10 @@ impl Declaration {
     /// get if this declaration is typedef
     pub fn is_typedef(&self) -> bool {
         self.is_typedef
+    }
+
+    pub fn has_type_qualifiers(&self) -> bool {
+        self.has_type_qualifiers
     }
 
     /// checkf if declaration is global by checking its belonging function is None
@@ -579,6 +587,7 @@ impl Default for Declaration {
             clang_type: CLangTypes::Invalid,
             is_extern : false,
             is_typedef : false,
+            has_type_qualifiers : false,
             init_declarator_list: vec![],
             ast_item : ASTItem::default(),
         }

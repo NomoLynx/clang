@@ -76,6 +76,11 @@ lazy_static! {
         m.insert("ft10".to_string(), "f30".to_string());
         m.insert("ft11".to_string(), "f31".to_string());
 
+        for index in 0..32 {
+            let name = format!("v{index}");
+            m.insert(name.clone(), name);
+        }
+
         m.insert(TEMP_REGISTER_NAME.to_string(), TEMP_REGISTER_NAME.to_string()); // a temporary register name for switching two registers
 
         m
@@ -239,6 +244,10 @@ impl RegisterUsage {
             Some(n) => n.starts_with("x"),
             None => false,
         }
+    }
+
+    pub fn is_vector_register(&self) -> bool {
+        self.get_reg_name().starts_with('v')
     }
 
     /// is s register

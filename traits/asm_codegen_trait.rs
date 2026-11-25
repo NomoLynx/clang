@@ -671,6 +671,11 @@ impl AsmCodeGenTrait for Statement {
             Statement::Iteration(_, n) => {
                 match n {
                     IterationStatement::FOR(_, n) => {
+                        if let Some(code) = rvv_matrix_add::generate_matrix_add(n, context)? {
+                            context.set_code_snippet(code);
+                            return Ok(());
+                        }
+
                         let start_stop_expr = &n.expression_statements;
                         let inc_expr = &n.clang_expression;
                         let statements = &n.statement;
@@ -1431,12 +1436,12 @@ impl AsmCodeGenTrait for Expression {
                         let array_type = n.get_index_operand_type();
                         let assignments = postfix.get_clang_expression().unwrap();
                         assert!(array_code.get_output_register_names().len() == 1, "arraycode output register should be 1, but got {}", array_code.get_output_register_names().len());
-                        let contaminated_regs = array_code.get_contaminated_registers();
+                        let live_base_regs = array_code.get_output_register_as_registerset();
                         let mut code = generate_array_access_asm_code2(self.get_ast_item(), 
                                 &array_type, 
                                 array_code.get_output_register_names().first().unwrap(), 
                                 assignments, 
-                                contaminated_regs, 
+                                live_base_regs,
                                 context)?;
                         code.set_debug_info(& format!("array access for {v}"));
                         let code_output_registers = code.get_output_register_names().to_vec();
@@ -1910,7 +1915,7 @@ impl AsmCodeGenTrait for AssignmentExpression {
                                 let template_name = hash.get(&template_key).unwrap();
                                 let mut template = context.get_code_with_debug2(& snippet_key, &template_name, &format!("{self}"), ast_item)?;
                                 let fixed_regs = left_code.get_output_register_as_registerset() + right_code.get_output_register_as_registerset();
-                                template.move_register_from(left_code.get_contaminated_registers() + right_code.get_contaminated_registers(), fixed_regs, context)?;
+                                template.move_register_from(fixed_regs.clone(), fixed_regs, context)?;
                                 template.get_input_registers_from(vec![&left_code, &right_code], context)?;
                                 template.insert_at_beginning(vec![right_code, left_code]);
 
@@ -1928,14 +1933,13 @@ impl AsmCodeGenTrait for AssignmentExpression {
                             }
                         }
                         else {
-                            // Keep RHS value register stable (it may be fixed by snippet templates),
-                            // and move LHS address/temp code away from RHS live registers instead.
-                            left_code.move_register_from(right_code.get_contaminated_registers(), [].into(), context)?;
+                            // RHS scratch values are dead; only its result must survive LHS address calculation.
+                            left_code.move_register_from(right_code.get_output_register_as_registerset(), [].into(), context)?;
                             let save_int_template_name = "save_value_to_address".to_string();
                             let template_name = hash.get(&op_name).unwrap_or(& save_int_template_name); //if op_name is AddAssign etc, it will return a template name. Otherwise, it is simple assignment.
                             let mut template = context.get_code_with_debug2(&snippet_key, &template_name, &format!("{self}"), ast_item)?;
                             let fixed_regs = left_code.get_output_register_as_registerset() + right_code.get_output_register_as_registerset();
-                            template.move_register_from(left_code.get_contaminated_registers() + right_code.get_contaminated_registers(), fixed_regs, context)?;
+                            template.move_register_from(fixed_regs.clone(), fixed_regs, context)?;
                             template.get_input_registers_from(vec![&left_code, &right_code], context)?;
                             template.insert_at_beginning(vec![right_code, left_code]);
 
@@ -1956,16 +1960,15 @@ impl AsmCodeGenTrait for AssignmentExpression {
                             Ok(())
                         }
                         else {
-                            // Keep RHS value register stable (it may be fixed by snippet templates),
-                            // and move LHS address/temp code away from RHS live registers instead.
-                            left_code.move_register_from(right_code.get_contaminated_registers(), [].into(), context)?;
+                            // RHS scratch values are dead; only its result must survive LHS address calculation.
+                            left_code.move_register_from(right_code.get_output_register_as_registerset(), [].into(), context)?;
                             let save_int_template_name = "save_value_to_address".to_string();
                             let template_name = hash.get(&op_name).unwrap_or(& save_int_template_name); //if op_name is AddAssign etc, it will return a template name. Otherwise, it is simple assignment.
                             let category = if context.get_code_gen_config().is_64bit_addressing() { SnippetKey::Long }
                                         else { SnippetKey::Int };
                             let mut template = context.get_code_with_debug2(&category, &template_name, &format!("{self}"), ast_item)?;
                             let fixed_regs = left_code.get_output_register_as_registerset() + right_code.get_output_register_as_registerset();
-                            template.move_register_from(left_code.get_contaminated_registers() + right_code.get_contaminated_registers(), fixed_regs, context)?;
+                            template.move_register_from(fixed_regs.clone(), fixed_regs, context)?;
                             template.get_input_registers_from(vec![&left_code, &right_code], context)?;  
                             template.insert_at_beginning(vec![right_code, left_code]);
 
@@ -2234,7 +2237,7 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
     array_type: &CLangTypes,
     base_address_reg: &str,    // register stored the base address of the array, which is calculated by the left part of the array access expression, for example, for structA.arrayB[xx], the base_address_reg is the register stored the address of structA.arrayB, and the offset of the array element will be added to this base address to get the final address
     assignments: &Vec<AssignmentExpression>,
-    contaminated_regs: RegisterSet,
+    live_base_regs: RegisterSet,
     context: &mut CodeGenContext) -> Result<CodeSnippet, CLangError> 
 {
 
@@ -2264,7 +2267,7 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
                                                 ast_item)?;
         index_code.replace_imm(& format!("{}", dimensions[i]));
         let fixed_regs = code.get_output_register_as_registerset() + assignment_code.get_output_register_as_registerset();
-        index_code.move_register_from(code.get_contaminated_registers() + assignment_code.get_contaminated_registers(), fixed_regs, context)?;
+        index_code.move_register_from(fixed_regs.clone(), fixed_regs, context)?;
         index_code.get_input_registers_from(vec![&code, &assignment_code], context)?;
         code.add_snippet(assignment_code);
         code.add_snippet(index_code);
@@ -2287,7 +2290,7 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
         )?;
         remaining_scale_code.replace_imm(&remaining_dim_product.to_string());
         remaining_scale_code.move_register_from(
-            code.get_impacted_regs_as_registerset() + code.get_output_register_as_registerset(),
+            code.get_output_register_as_registerset(),
             [].into(),
             context,
         )?;
@@ -2306,8 +2309,7 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
     // offset *= base_type size
     let mut load_address_code = context.get_code_with_debug("mul_const", "multiply data size", ast_item)?;
     load_address_code.replace_imm(base_type.get_type_size_in_bytes(context).unwrap().to_string().as_str());
-    load_address_code.move_register_from(code.get_impacted_regs_as_registerset()
-                                                + code.get_output_register_as_registerset(),
+    load_address_code.move_register_from(code.get_output_register_as_registerset(),
                                                 [].into(),
                                             context)?;
     // Bind mul_const input/output to current offset register explicitly.
@@ -2329,7 +2331,7 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
     code.add_snippet(load_address_code);
 
     // final address = stack_offset + offset
-    code.move_register_from(contaminated_regs, [].into(), context)?;
+    code.move_register_from(live_base_regs, [].into(), context)?;
     let output_reg = code.get_output_register_names().first().unwrap().clone();
 
     // the base_address_reg is the register that already contains the base address of the array, so we can directly add the offset to this register 
@@ -2341,7 +2343,7 @@ fn generate_array_access_asm_code2(ast_item: &ASTItem,
     if !context.is_const_expresion_on_left() && is_full_indexed {
         // load value from the final address
         let mut load_value_code = context.get_code_with_debug2(& base_type.into(), "load_address_to_reg", "load array value", ast_item)?;
-        load_value_code.move_register_from(code.get_contaminated_registers(), base_address_reg.into(),  context)?;
+        load_value_code.move_register_from(code.get_output_register_as_registerset(), base_address_reg.into(),  context)?;
         load_value_code.set_input_register(base_address_reg);
         code.set_output_register_names(load_value_code.get_output_register_names().to_vec());
         code.add_snippet(load_value_code);

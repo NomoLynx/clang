@@ -104,3 +104,35 @@ The implementation covers the kinds of constructs typically required for a small
 ## Summary
 
 The CLang implementation in this directory is a Rust-based C compiler frontend and backend aimed at compiling a useful subset of C into assembly for the project’s RISC-V ecosystem. It combines parsing, AST modeling, semantic analysis, symbol resolution, type checking, register assignment, and code generation into one pipeline.
+
+## Opt-in RVV integer matrix addition
+
+Set `CLangBuildParameters.enable_rvv = true` to enable the RV64 + V 1.0
+matrix-add pilot. It defaults to `false` in all supplied build configurations.
+The compiler reports the number of lowered matrix-add nests when enabled.
+
+The supported ordinary-C pattern is a pair of `for` loops with separately
+declared `int` indices, literal positive bounds matching the complete two
+dimensions, initialization to zero and increments of the form `i = i + 1`.
+The only inner statement must be `c[i][j] = a[i][j] + b[i][j]`, using three
+distinct, unqualified, directly declared 32-bit integer arrays of the same
+shape. Pointer/parameter aliases, partial/transposed accesses, casts,
+qualified objects, additional side effects and other operations keep their
+existing scalar lowering.
+
+The backend linearizes this side-effect-free row-major nest and emits real
+`vsetvli`, `vle32.v`, `vadd.vv` and `vse32.v` instructions with `e32,m1,ta,ma`.
+Each iteration advances by the returned VL, not a hardcoded lane count.
+The original final induction-variable values are retained. Scalar scratch
+registers are saved/restored with full-width RV64 `sd`/`ld`; vector temporaries
+`v8`-`v10`, `vl` and `vtype` are clobbered, with no live vector values across calls.
+
+Build the resulting assembly through `riscv_asm_lib`, then run its ELF under
+an RVV-enabled QEMU CPU. Acceptance requires both observed guest exit 42/142
+and evidence that the actual ELF contains and executes the vector-add block.
+An exit of 42 from a scalar-only build does not validate this optimization.
+Assembly serialization must retain the `vsetvli` configuration, vector masks
+and memory operands; the assembler has a parse/print/reparse regression for
+these fields. Matrix addressing and assignment lowering preserve live results
+rather than treating already-dead scalar temporaries as live values.
+The lowering follows the [RISC-V V 1.0 specification](https://docs.riscv.org/reference/isa/v20260120/unpriv/v-st-ext.html).

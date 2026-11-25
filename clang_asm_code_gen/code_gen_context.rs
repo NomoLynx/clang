@@ -80,6 +80,8 @@ pub struct CodeGenContext {
 
     /// code snippet cache for code generation
     code_snippet : CodeSnippet,
+
+    rvv_vectorized_loops : u32,
 }
 
 impl CodeGenContext {
@@ -557,6 +559,7 @@ impl CodeGenContext {
             .as_ref()
             .and_then(|x| x.parse::<u32>().ok());
         r.get_code_gen_config_mut().set_stack_space_size(stack_space_size);
+        r.get_code_gen_config_mut().set_enable_rvv(para.enable_rvv);
         r
     }
 }
@@ -591,6 +594,7 @@ impl Default for CodeGenContext {
             type_config : TypeConfiguration::default(),
             is_build_to_lib : false,
             code_snippet : CodeSnippet::default(),
+            rvv_vectorized_loops : 0,
         };
 
         let type_mapping_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

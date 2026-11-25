@@ -3,5 +3,6 @@
     "output_folder": null,
     "is_print_debug": false,
     "is_build_to_lib": false,
+    "enable_rvv": false,
     "stack_space_size": null
 }
