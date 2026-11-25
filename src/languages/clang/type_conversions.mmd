@@ -1,0 +1,10 @@
+---
+title: Type conversions in Clang
+---
+stateDiagram-v2
+    &str --> CLangTypes : from_string
+    &String --> CLangTypes : from_string
+    String --> CLangTypes : from_string2
+    Option<String> --> CLangTypes : from_option_string
+    &TypeSpecifier --> CLangTypes : from_type_specifier_ref
+    &CLangBuildParameters --> CodeGenContext : from_clang_build_parameters

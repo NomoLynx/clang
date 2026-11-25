@@ -1,0 +1,32 @@
+# fn invoke pattern
+
+this document define a pattern to match the function definition.
+
+## struct name
+
+- FunctionInvokeLogic
+
+this is the name of the struct will be visible to invoker.
+
+## pattern nodes definition
+
+| node_name | definition | is_output |
+| --- | --- | --- |
+| expr_post | is_expr_post | |
+| expr | is_expression |  |
+| id | is_atom_item_id | y |
+| postfix_expr_part | is_arguments | y |
+
+## mermaid display
+
+```mermaid
+---
+title: expression to function call
+---
+
+flowchart TB
+    expr_post --> expr
+    expr -.1.-> id
+    expr_post --> postfix_expr_part
+
+```
