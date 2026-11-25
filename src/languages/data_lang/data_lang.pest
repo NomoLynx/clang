@@ -1,0 +1,3 @@
+list_char = _{ !("," | ":") ~ ANY }
+list_id = { list_char+ }
+list = { list_id ~ ":" ~ list_id ~ ("," ~ list_id)* }
