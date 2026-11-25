@@ -14,6 +14,10 @@ The compiler pipeline is centered around `CLangProgram` and the build entry poin
 
 This is not a full general-purpose ISO C compiler; it is a focused compiler for a subset of C that targets the project’s internal assembly and RISC-V toolchain.
 
+The intended source baseline is K&R/pre-ANSI C. The current grammar also
+accepts some later extensions, including `//` comments and `const`/`volatile`;
+this is not a claim of strict dialect conformance.
+
 ## Compiler pipeline
 
 ### 1. Parsing and AST creation
@@ -110,6 +114,12 @@ The CLang implementation in this directory is a Rust-based C compiler frontend a
 Set `CLangBuildParameters.enable_rvv = true` to enable the RV64 + V 1.0
 matrix-add pilot. It defaults to `false` in all supplied build configurations.
 The compiler reports the number of lowered matrix-add nests when enabled.
+
+The matrix-add fixture uses K&R-style source constructs: block comments,
+declarations before executable statements, fixed-size arrays and indices
+declared outside `for`. It requires no ANSI function prototypes, C99 syntax
+or headers, vector intrinsics or inline assembly. The `Int32` restriction is
+a target-type requirement, independent of the source-language revision.
 
 The supported ordinary-C pattern is a pair of `for` loops with separately
 declared `int` indices, literal positive bounds matching the complete two
