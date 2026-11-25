@@ -60,6 +60,8 @@ pub struct CodeGenConfiguration {
 
     /// optional stack size in bytes for generated `.data` stack section
     stack_space_size : Option<u32>,
+
+    enable_rvv : bool,
 }
 
 impl CodeGenConfiguration {
@@ -183,6 +185,14 @@ impl CodeGenConfiguration {
         self.stack_space_size = stack_space_size;
     }
 
+    pub fn get_enable_rvv(&self) -> bool {
+        self.enable_rvv
+    }
+
+    pub fn set_enable_rvv(&mut self, enable_rvv: bool) {
+        self.enable_rvv = enable_rvv;
+    }
+
     /// get the number of parameter registers, for risc-v, it is 8
     pub fn get_parameter_register_number(&self) -> u32 {
         self.param_reg_num
@@ -237,6 +247,7 @@ impl Default for CodeGenConfiguration {
             param_reg_num : 8,
             enum_base_type_size_in_bytes : 4,
             stack_space_size : None,
+            enable_rvv : false,
         }
     }
 }

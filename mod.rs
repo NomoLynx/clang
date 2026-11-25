@@ -112,6 +112,9 @@ pub fn build_clang(para:&CLangBuildParameters) -> Result<(), String> {
                             let code = r.generate_code(&mut asm_context);
                             match code {
                                 Ok(_) => {
+                                    if para.enable_rvv {
+                                        output_string(format!("RVV matrix-add lowerings: {}", asm_context.get_rvv_vectorized_loops()));
+                                    }
                                     let s = asm_context.get_code_snippet().clone();
                                     let file_name_without_extension = get_file_name_without_extension(&full_path).unwrap();
                                     let meta_info = r.generate_meta_info();
