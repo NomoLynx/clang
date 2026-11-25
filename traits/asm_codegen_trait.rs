@@ -960,10 +960,7 @@ impl AsmCodeGenTrait for Atom {
         let ast_item = self.get_ast_item();
         match &**self.get_item() {
             AtomItem::BasicTypeObject(_, v) => {
-                
-                let ty : CLangTypes = v.get_type_def()
-                                        .map_err(|e| CLangError::NoFound((file!().to_string(), line!()), format!("{e:?}")))?
-                                        .into();
+                let ty: CLangTypes = v.get_clang_type();
 
                 let n = if ty.is_char() { format!("'{v}'")} 
                                 else { v.to_string() };

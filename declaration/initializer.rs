@@ -1,6 +1,5 @@
 use pest::iterators::Pair;
 
-use crate::ast::decl;
 use crate::languages::clang::clang_pest::ParameterType;
 use crate::languages::clang::{ASTItem, CLangItem, assignment_expression::*, clang_pest::Rule};
 use crate::languages::clang::CLangError;

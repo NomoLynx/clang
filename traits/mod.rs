@@ -1,13 +1,13 @@
-pub (crate) mod symbol_table;
-pub (crate) mod display_diagram_trait;
-pub (crate) mod to_symbol_table_element_trait;
-pub (crate) mod to_markdown_table_row_trait;
-pub (crate) mod scope_trait;
-pub (crate) mod asm_codegen_trait;
-pub (crate) mod to_symbol_table_elements_trait;
-pub (crate) mod ast_item_trait;
-pub (crate) mod get_clangtype_trait;
-pub (crate) mod state_diagram_node_trait;
+pub mod symbol_table;
+pub mod display_diagram_trait;
+pub mod to_symbol_table_element_trait;
+pub mod to_markdown_table_row_trait;
+pub mod scope_trait;
+pub mod asm_codegen_trait;
+pub mod to_symbol_table_elements_trait;
+pub mod ast_item_trait;
+pub mod get_clangtype_trait;
+pub mod state_diagram_node_trait;
 
 pub use ast_item_trait::*;
 pub use asm_codegen_trait::*;

@@ -11,9 +11,9 @@ use rust_macro::*;
 
 #[derive(Parser)]
 #[grammar = "languages/clang/clang.pest"]
-pub(crate) struct CLangParser;
+pub struct CLangParser;
 
-pub(crate) fn parse_clang(input: &str, context:&mut CodeGenContext) -> Result<CLangProgram, CLangError> {
+pub fn parse_clang(input: &str, context:&mut CodeGenContext) -> Result<CLangProgram, CLangError> {
     let mut pairs = CLangParser::parse(Rule::clang_program, input)
         .map_err(|e| CLangError::get_location_from_pest_input_location(e.line(), &e.line_col))?;
     if let Some(pair) = pairs.find(|n| n.as_str().len() == input.len()) {
@@ -66,7 +66,7 @@ pub fn parse_clang_symbol_table(prog:&mut CLangProgram, context:&mut CodeGenCont
 
 /// iterate the parsing AST tree, set up the unique id for each node
 /// also set up symbol table, semantic linkages, type system, etc.
-pub (crate) fn parse_clang_2nd(prog:&mut CLangProgram, context:&mut CodeGenContext) -> Result<(), CLangError> {
+pub fn parse_clang_2nd(prog:&mut CLangProgram, context:&mut CodeGenContext) -> Result<(), CLangError> {
     parse_clang_symbol_table(prog, context)?;
     
     context.write_diagram_file(prog)?;

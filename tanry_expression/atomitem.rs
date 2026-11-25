@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use rust_macro::GenIsEnumVariant;
 
-use crate::ast::clr_basic_type_object::CLRBasicTypeObject;
+use crate::languages::clang::basic_value::BasicValue;
 use crate::languages::clang::clang_asm_code_gen::CodeGenContext;
 use crate::languages::clang::symbol_table::MemberOffset;
 use crate::languages::clang::traits::ASTItemTrait;
@@ -13,7 +13,7 @@ use crate::languages::clang::tanry_expression::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, GenIsEnumVariant)]
 pub enum AtomItem {
-    BasicTypeObject(ASTItem, CLRBasicTypeObject),
+    BasicTypeObject(ASTItem, BasicValue),
     Id(ASTItem, String),
     Expression(ASTItem, Expression),
     TanryExpression(ASTItem, TanryExpression),
@@ -44,7 +44,7 @@ impl AtomItem {
     }
 
     /// get string value for BasicTypeObject case; all other cases are None
-    /// its string value is n.to_string() where n is the CLRBasicTypeObject
+    /// its string value is n.to_string() where n is the literal BasicValue
     pub fn get_string_value(&self) -> Option<String> {
         match self {
             Self::BasicTypeObject(_, n) => {
@@ -71,9 +71,7 @@ impl AtomItem {
 
         match self {
             Self::BasicTypeObject(_, n) => {
-                let type_def = n.get_type_def().unwrap();
-                let clang_type : CLangTypes = type_def.into();
-                clang_type
+                n.get_clang_type()
             },
             Self::Expression(_, n) => n.get_clang_type(),
             Self::Id(ast_item, id) => {

@@ -1,13 +1,13 @@
-pub (crate) mod code_gen_context;
-pub (crate) mod code_gen_configuration;
-pub (crate) mod clang_asm_code_gen;
-pub (crate) mod register_set;
-pub (crate) mod code_snippet;
-pub (crate) mod code_snippet_archive;
-pub (crate) mod markdowndata;
-pub(crate) mod codesnippet_data_item;
-pub(crate) mod snippet_key;
-pub(crate) mod register_usage;
+pub mod code_gen_context;
+pub mod code_gen_configuration;
+pub mod clang_asm_code_gen;
+pub mod register_set;
+pub mod code_snippet;
+pub mod code_snippet_archive;
+pub mod markdowndata;
+pub mod codesnippet_data_item;
+pub mod snippet_key;
+pub mod register_usage;
 
 pub use code_gen_context::*;
 pub use code_gen_configuration::*;

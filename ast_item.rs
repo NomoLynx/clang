@@ -11,7 +11,6 @@ use crate::languages::clang::struct_union::StructUnionSpecifier;
 use crate::languages::clang::tanry_expression::AtomItem;
 use crate::languages::clang::traits::ASTItemTrait;
 use crate::languages::clang::type_system::CLangRuntimeType;
-use crate::languages::mermaid_lang::zenUml_pest::Rule::aliases;
 use crate::languages::{SourceFileLocation, clang::declaration::Declaration};
 use crate::languages::clang::clang_asm_code_gen::*;
 use crate::languages::clang::sematic_linkage::*;

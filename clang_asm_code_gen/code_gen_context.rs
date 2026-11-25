@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::languages::clang::traits::*;
-use crate::{clr_lib::unique_id::UniqueId, languages::clang::{ASTItem, CLangError, clang_item::CLangItem, clang_program::CLangProgram, clang_types::CLangTypes, symbol_table::SymbolTable, traits::display_diagram_trait::StateDiagramDisplay}};
+use crate::languages::clang::{ASTItem, CLangError, clang_item::CLangItem, clang_program::CLangProgram, clang_types::CLangTypes, symbol_table::SymbolTable, traits::display_diagram_trait::StateDiagramDisplay};
 use crate::languages::markdown_lang::to_clr_type::*;
 use super::code_gen_configuration::CodeGenConfiguration;
 use crate::languages::clang::clang_asm_code_gen::*;
@@ -9,6 +9,7 @@ use crate::languages::clang::type_system::*;
 use core_utils::debug::*;
 use parser_lib::markdown_lang::*;
 use core_utils::filesystem::*;
+use core_utils::unique_id::UniqueId;
 
 use rust_macro::*;
 use rust_macro_internal::state_type_mapping;

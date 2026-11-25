@@ -3,7 +3,6 @@ use std::fmt::{self, Display, Formatter};
 use pest::Parser;
 use rust_macro_internal::state_type_mapping;
 
-use crate::ast::clr_type::{TypeBase, TypeDef};
 use crate::languages::clang::symbol_table::SymbolTable;
 use core_utils::debug::*;
 use crate::languages::clang::clang_asm_code_gen::CodeGenConfiguration;
@@ -809,39 +808,6 @@ impl From<&mut TypeSpecifier> for CLangTypes {
 impl From<&TypeName> for CLangTypes {
     fn from(ty: &TypeName) -> Self {
         ty.get_specifiers_qualifiers().into()
-    }
-}
-
-impl From<&TypeDef> for CLangTypes {
-    fn from(t: &TypeDef) -> Self {
-        match t {
-            TypeDef::TypeDef(n) => {
-                match n {
-                    TypeBase::Void => CLangTypes::Void,
-                    TypeBase::Char => CLangTypes::Char,
-                    TypeBase::Int32 => CLangTypes::Int32,
-                    TypeBase::UInt32 => CLangTypes::UInt32,
-                    TypeBase::Int16 => CLangTypes::Int16,
-                    TypeBase::UInt16 => CLangTypes::UInt16,
-                    TypeBase::Int64 => CLangTypes::Int64,
-                    TypeBase::UInt64 => CLangTypes::UInt64,
-                    TypeBase::Float32 => CLangTypes::Float32,
-                    TypeBase::Float64 => CLangTypes::Float64,
-                    TypeBase::String => CLangTypes::Pointer(1, Box::new(CLangTypes::Char)),
-                    _ => {
-                        warn_string(format!("Possible missing a case for type '{n:?}'"));
-                        CLangTypes::Invalid
-                    }
-                }
-            }
-            _ => CLangTypes::Invalid,
-        }
-    }
-}
-
-impl From<TypeDef> for CLangTypes {
-    fn from(t: TypeDef) -> Self {
-        (&t).into()
     }
 }
 
