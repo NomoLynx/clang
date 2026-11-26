@@ -126,7 +126,7 @@ pub fn build_clang(para:&CLangBuildParameters) -> Result<(), String> {
                                     }
 
                                     if let Some(folder) = output_folder {
-                                        asm_solution.set_container_path(&folder);
+                                        asm_solution.set_container_path(Some(folder.clone()));
                                         asm_solution.save_to_disk(&folder);
                                     }
                                     else {
