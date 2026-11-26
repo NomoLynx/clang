@@ -214,12 +214,15 @@ fn matrix_access<'a>(
     };
     if element.as_ref() != &CLangTypes::Int32
         || dimensions.get_dimensions_values().as_slice() != [row.bound as usize, column.bound as usize]
-        || (!symbol.is_global_variable()
-            && !matches!(storage(symbol), Some(SymbolLocation::Stack(_) | SymbolLocation::Memory(_))))
     {
         return None;
     }
-    Some(symbol)
+
+    // Scalar layout can pack arrays after bytes; global layout has no proven alignment.
+    match storage(symbol) {
+        Some(SymbolLocation::Stack(offset)) if *offset % 4 == 0 => Some(symbol),
+        _ => None,
+    }
 }
 
 fn emit_address(code: &mut String, symbol: &SymbolEntry, register: &str) -> Result<(), CLangError> {
@@ -246,7 +249,10 @@ pub(crate) fn generate_matrix_add(
     context: &mut CodeGenContext,
 ) -> Result<Option<CodeSnippet>, CLangError> {
     let config = context.get_code_gen_config();
-    if !config.get_enable_rvv() || !config.is_64bit_addressing() {
+    if !config.get_enable_rvv()
+        || !config.is_64bit_addressing()
+        || config.get_stack_space_size().is_some()
+    {
         return Ok(None);
     }
     let Some(Statement::Iteration(_, IterationStatement::FOR(_, inner))) =
@@ -304,10 +310,7 @@ pub(crate) fn generate_matrix_add(
 
     // The full, side-effect-free nest spans three distinct row-major objects.
     let label = format!("__rvv_matrix_add_{}", context.attain_unique_id());
-    let mut code = String::from(".text\n.option arch, +v\naddi sp, sp, -48\n");
-    for index in 0..6 {
-        code.push_str(&format!("sd t{index}, {}(sp)\n", index * 8));
-    }
+    let mut code = String::from(".text\n.option arch, +v\n");
     emit_address(&mut code, left, "t0")?;
     emit_address(&mut code, right, "t1")?;
     emit_address(&mut code, destination, "t2")?;
@@ -318,20 +321,21 @@ pub(crate) fn generate_matrix_add(
          vle32.v v9, (t1)\n\
          vadd.vv v10, v8, v9\n\
          vse32.v v10, (t2)\n\
-         slli t5, t4, 2\n\
-         add t0, t0, t5\n\
-         add t1, t1, t5\n\
-         add t2, t2, t5\n\
          sub t3, t3, t4\n\
+         slli t4, t4, 2\n\
+         add t0, t0, t4\n\
+         add t1, t1, t4\n\
+         add t2, t2, t4\n\
          bne t3, zero, {label}\n"
     ));
 
     let mut register_updates = String::new();
-    let mut clobbers = vec!["v8".to_string(), "v9".to_string(), "v10".to_string()];
+    let mut clobbers = (0..5).map(|index| format!("t{index}")).collect::<Vec<_>>();
+    clobbers.extend(["v8", "v9", "v10"].iter().map(|name| name.to_string()));
     for counter in [&row, &column] {
         if counter.symbol.is_global_variable() {
             emit_address(&mut code, counter.symbol, "t4")?;
-            code.push_str(&format!("li t5, {}\nsw t5, 0(t4)\n", counter.bound));
+            code.push_str(&format!("li t3, {}\nsw t3, 0(t4)\n", counter.bound));
             continue;
         }
 
@@ -342,20 +346,16 @@ pub(crate) fn generate_matrix_add(
             }
             Some(SymbolLocation::Stack(_) | SymbolLocation::Memory(_)) => {
                 emit_address(&mut code, counter.symbol, "t4")?;
-                code.push_str(&format!("li t5, {}\nsw t5, 0(t4)\n", counter.bound));
+                code.push_str(&format!("li t3, {}\nsw t3, 0(t4)\n", counter.bound));
             }
             _ => return Err(CLangError::cannot_emit("RVV matrix add lost its induction variable storage")),
         }
     }
-    for index in 0..6 {
-        code.push_str(&format!("ld t{index}, {}(sp)\n", index * 8));
-    }
-    code.push_str("addi sp, sp, 48\n");
     code.push_str(&register_updates);
 
     let mut snippet = CodeSnippet::from_asm_code_str("rvv_matrix_add", &code)?;
     snippet.set_impacted_regs(clobbers);
-    snippet.set_input_register_names(vec!["fp".to_string(), "sp".to_string()]);
+    snippet.set_input_register_names(vec!["fp".to_string()]);
     context.set_rvv_vectorized_loops(context.get_rvv_vectorized_loops() + 1);
     Ok(Some(snippet))
 }
@@ -365,27 +365,41 @@ mod tests {
     use super::*;
     use crate::languages::clang::clang_pest::{parse_clang, parse_clang_2nd};
     use crate::languages::clang::traits::AsmCodeGenTrait;
-    use super::super::{RegisterSet, RegisterUsage};
+    use super::super::{CodeSnippetDataItem, RegisterSet, RegisterUsage};
 
-    fn compile(declarations: &str, body: &str, enable_rvv: bool) -> (String, u32) {
-        let source = format!(
-            "{declarations}\nint main() {{ int row; int col;\n\
+    fn matrix_source(declarations: &str, body: &str) -> String {
+        format!(
+            "int main() {{ {declarations} int row; int col;\n\
+             for (row = 0; row < 2; row = row + 1) {{\n\
+                 for (col = 0; col < 5; col = col + 1) {{\n\
+                     lhs[row][col] = 1; rhs[row][col] = 2;\n\
+                 }}\n\
+             }}\n\
              for (row = 0; row < 2; row = row + 1) {{\n\
                  for (col = 0; col < 5; col = col + 1) {{ {body} }}\n\
              }}\nreturn row + col; }}"
-        );
-        compile_source(&source, enable_rvv)
+        )
+    }
+
+    fn compile(declarations: &str, body: &str, enable_rvv: bool) -> (String, u32) {
+        compile_source(&matrix_source(declarations, body), enable_rvv)
     }
 
     fn compile_source(source: &str, enable_rvv: bool) -> (String, u32) {
+        let (code, count) = compile_ir(source, enable_rvv, None);
+        (code.generate_code_string_with_section(true), count)
+    }
+
+    fn compile_ir(source: &str, enable_rvv: bool, stack_space_size: Option<u32>) -> (CodeSnippet, u32) {
         let mut context = CodeGenContext::default();
         context.set_symbol_table_md_file_name(None);
         context.get_code_gen_config_mut().set_enable_rvv(enable_rvv);
+        context.get_code_gen_config_mut().set_stack_space_size(stack_space_size);
         let mut program = parse_clang(source, &mut context).expect("parse matrix regression");
         parse_clang_2nd(&mut program, &mut context).expect("analyze matrix regression");
         program.generate_code(&mut context).expect("generate matrix regression");
         (
-            context.get_code_snippet().generate_code_string_with_section(true),
+            context.get_code_snippet().clone(),
             context.get_rvv_vectorized_loops(),
         )
     }
@@ -400,7 +414,7 @@ mod tests {
 
         let (vector, vector_count) = compile(declarations, body, true);
         assert_eq!(vector_count, 1);
-        for instruction in ["vsetvli", "vle32.v", "vadd.vv", "vse32.v", "slli", "sd", "ld"] {
+        for instruction in ["vsetvli", "vle32.v", "vadd.vv", "vse32.v", "slli"] {
             assert!(vector.contains(instruction), "missing {instruction}");
         }
         assert!(vector.contains("__rvv_matrix_add_"));
@@ -413,13 +427,18 @@ mod tests {
         for body in [
             "lhs[row][col] = lhs[row][col] + rhs[row][col];",
             "result[row][col] = lhs[row][col] - rhs[row][col];",
-            "result[row][col] = lhs[row][col] + rhs[row][col]; row = row + 1;",
-            "result[col][row] = lhs[row][col] + rhs[row][col];",
+            "result[row][col] = lhs[row][col] + rhs[row][col]; rhs[row][col] = 3;",
         ] {
             let (code, count) = compile(declarations, body, true);
             assert_eq!(count, 0, "unsafe matrix loop was vectorized: {body}");
             assert!(!code.contains("vadd.vv"));
         }
+        let (_, count) = compile(
+            "int lhs[2][5]; int rhs[2][5]; int result[5][2];",
+            "result[col][row] = lhs[row][col] + rhs[row][col];",
+            true,
+        );
+        assert_eq!(count, 0);
         let (_, count) = compile(
             "volatile int lhs[2][5]; int rhs[2][5]; int result[2][5];",
             "result[row][col] = lhs[row][col] + rhs[row][col];",
@@ -429,9 +448,55 @@ mod tests {
     }
 
     #[test]
-    fn rvv_local_matrix_initialization_and_complete_checks_preserve_live_addresses() {
+    fn rvv_matrix_add_refuses_unproven_alignment() {
+        let body = "result[row][col] = lhs[row][col] + rhs[row][col];";
+        let (code, count) = compile(
+            "char pad[3]; int lhs[2][5]; int rhs[2][5]; int result[2][5];",
+            body,
+            true,
+        );
+        assert_eq!(count, 0);
+        assert!(!code.contains("vadd.vv"));
+
+        let source = "
+            int lhs[2][5]; int rhs[2][5]; int result[2][5];
+            int main() {
+                int row; int col;
+                for (row = 0; row < 2; row = row + 1) {
+                    for (col = 0; col < 5; col = col + 1) {
+                        result[row][col] = lhs[row][col] + rhs[row][col];
+                    }
+                }
+                return 42;
+            }";
+        let (code, count) = compile_source(source, true);
+        assert_eq!(count, 0);
+        assert!(!code.contains("vadd.vv"));
+
+        let local = matrix_source(
+            "int lhs[2][5]; int rhs[2][5]; int result[2][5];",
+            body,
+        );
+        let (code, count) = compile_ir(&local, true, Some(4096));
+        assert_eq!(count, 0);
+        assert!(!code.generate_code_string_with_section(true).contains("vadd.vv"));
+    }
+
+    fn matrix_snippet(code: &CodeSnippet) -> Option<&CodeSnippet> {
+        if code.get_name() == "rvv_matrix_add" {
+            return Some(code);
+        }
+        code.get_code_items().into_iter().find_map(|item| match item {
+            CodeSnippetDataItem::Snippet(child) => matrix_snippet(child),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn rvv_nested_matrix_statements_declare_clobbers_without_stack_writes() {
         let source = "
             int main() {
+              {
                 int lhs[2][5];
                 int rhs[2][5];
                 int result[2][5];
@@ -453,12 +518,22 @@ mod tests {
                         if (result[row][col] != 3) { return 7; }
                     }
                 }
-                return 42;
+              }
+              return 42;
             }";
         for enabled in [false, true] {
-            let (code, count) = compile_source(source, enabled);
+            let (ir, count) = compile_ir(source, enabled, None);
+            let code = ir.generate_code_string_with_section(true);
             assert_eq!(count, u32::from(enabled));
             assert_eq!(code.contains("vadd.vv"), enabled);
+            if enabled {
+                let matrix = matrix_snippet(&ir).expect("nested RVV matrix snippet");
+                let clobbers = matrix.get_contaminated_registers().get_register_alias_name();
+                for index in 0..5 {
+                    assert!(clobbers.contains(&format!("t{index}")));
+                }
+                assert!(!matrix.get_all_registers().get_sorted_reg_names().contains(&"x2".to_string()));
+            }
         }
     }
 

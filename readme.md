@@ -125,17 +125,22 @@ The supported ordinary-C pattern is a pair of `for` loops with separately
 declared `int` indices, literal positive bounds matching the complete two
 dimensions, initialization to zero and increments of the form `i = i + 1`.
 The only inner statement must be `c[i][j] = a[i][j] + b[i][j]`, using three
-distinct, unqualified, directly declared 32-bit integer arrays of the same
-shape. Pointer/parameter aliases, partial/transposed accesses, casts,
-qualified objects, additional side effects and other operations keep their
-existing scalar lowering.
+distinct, unqualified, directly declared local 32-bit integer arrays of the
+same shape, with stack offsets proven 4-byte aligned. Globals have no checked
+alignment guarantee in the current data emitter and keep scalar lowering,
+as do custom data-stack configurations, unaligned locals, pointer/parameter
+aliases, partial/transposed accesses, casts, qualified objects, additional
+side effects and other operations.
 
 The backend linearizes this side-effect-free row-major nest and emits real
 `vsetvli`, `vle32.v`, `vadd.vv` and `vse32.v` instructions with `e32,m1,ta,ma`.
 Each iteration advances by the returned VL, not a hardcoded lane count.
-The original final induction-variable values are retained. Scalar scratch
-registers are saved/restored with full-width RV64 `sd`/`ld`; vector temporaries
-`v8`-`v10`, `vl` and `vtype` are clobbered, with no live vector values across calls.
+The original final induction-variable values are retained. Statement temporaries
+`t0`-`t4`, vector temporaries `v8`-`v10`, `vl` and `vtype` are clobbered, with
+no live vector values across calls. The lowering declares its scalar clobbers
+instead of saving below `sp`, where nested-scope locals can reside in the
+current compiler. The native fixture also checks input preservation and
+stack-resident guard arrays and includes nested-scope storage.
 
 Build the resulting assembly through `riscv_asm_lib`, then run its ELF under
 an RVV-enabled QEMU CPU. Acceptance requires both observed guest exit 42/142
