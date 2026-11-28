@@ -109,45 +109,121 @@ The implementation covers the kinds of constructs typically required for a small
 
 The CLang implementation in this directory is a Rust-based C compiler frontend and backend aimed at compiling a useful subset of C into assembly for the project’s RISC-V ecosystem. It combines parsing, AST modeling, semantic analysis, symbol resolution, type checking, register assignment, and code generation into one pipeline.
 
-## Opt-in RVV integer matrix addition
+## Opt-in RVV integer elementwise operations
 
 Set `CLangBuildParameters.enable_rvv = true` to enable the RV64 + V 1.0
-matrix-add pilot. It defaults to `false` in all supplied build configurations.
-The compiler reports the number of lowered matrix-add nests when enabled.
+elementwise pilot. It defaults to `false` in all supplied build configurations.
+The compiler reports `RVV elementwise lowerings: N` when enabled.
 
-The matrix-add fixture uses K&R-style source constructs: block comments,
+The matrix fixtures use K&R-style source constructs: block comments,
 declarations before executable statements, fixed-size arrays and indices
 declared outside `for`. It requires no ANSI function prototypes, C99 syntax
 or headers, vector intrinsics or inline assembly. The `Int32` restriction is
 a target-type requirement, independent of the source-language revision.
 
-The supported ordinary-C pattern is a pair of `for` loops with separately
-declared `int` indices, literal positive bounds matching the complete two
+The supported ordinary-C pattern is a nest of two or three `for` loops with separately
+declared `int` indices, literal positive bounds matching every complete array
 dimensions, initialization to zero and increments of the form `i = i + 1`.
-The only inner statement must be `c[i][j] = a[i][j] + b[i][j]`, using three
+The only inner statement must be elementwise `c[...] = a[...] + b[...]` or
+`c[...] = a[...] - b[...]`, using three
 distinct, unqualified, directly declared local 32-bit integer arrays of the
 same shape, with stack offsets proven 4-byte aligned. Globals have no checked
 alignment guarantee in the current data emitter and keep scalar lowering,
-as do custom data-stack configurations, unaligned locals, pointer/parameter
+as do custom data-stack configurations, pointer/parameter
 aliases, partial/transposed accesses, casts, qualified objects, additional
-side effects and other operations.
+side effects, other operations and ranks above three. A function containing
+unmodelled inline assembly is also excluded: raw register values and vector
+configuration cannot be assumed dead.
 
 The backend linearizes this side-effect-free row-major nest and emits real
-`vsetvli`, `vle32.v`, `vadd.vv` and `vse32.v` instructions with `e32,m1,ta,ma`.
+`vsetvli`, `vle32.v`, `vadd.vv`/`vsub.vv` and `vse32.v` instructions with `e32,m1,ta,ma`.
 Each iteration advances by the returned VL, not a hardcoded lane count.
-The original final induction-variable values are retained. Statement temporaries
-`t0`-`t4`, vector temporaries `v8`-`v10`, `vl` and `vtype` are clobbered, with
-no live vector values across calls. The lowering declares its scalar clobbers
-instead of saving below `sp`, where nested-scope locals can reside in the
-current compiler. The native fixture also checks input preservation and
-stack-resident guard arrays and includes nested-scope storage.
+Dimension products and byte spans are checked before flattening. Every
+induction variable retains its original final value. Subtraction keeps the
+left input in `vs2` and the right input in `vs1`; it is not reverse subtraction.
+
+[The lowering](clang_asm_code_gen/rvv_elementwise.rs) separates the canonical
+nest/shape match, operation, scratch bindings and instruction emission.
+Adding another operation requires a justified instruction/oracle and tests;
+adding another rank requires complete index/shape matching and final-state checks.
+
+### Local liveness and scratch ownership
+
+Snippet outputs are returned values. Declared temporaries are internal scratch;
+impacted registers include semantic writes such as updated induction variables.
+`get_contaminated_registers()` conservatively collects these effects, including
+child effects. It is **not** a live-out set, and an output in a register need
+not mean the snippet wrote that register (a variable read can return its location).
+
+At a producer/consumer boundary, `live_outputs_with(live_through)` protects the
+producer's results plus values still owned by an enclosing computation. Dead
+producer scratch is not protected merely because it was used. Fixed inputs and
+intentional in-place outputs are bound explicitly at their last use. Persistent
+C variables use their assigned S/argument registers or memory; their state is
+not treated as anonymous, reusable T-register scratch.
+
+[CodeGenContext](clang_asm_code_gen/code_gen_context.rs) provides scoped
+`with_live_registers` and atomic `with_scratch_registers` reservations. The RVV
+kernel requests five GPR temporaries and three LMUL=1 vector groups, excluding
+live values and outstanding reservations. `t0`-`t4` and `v8`-`v10` are only the
+deterministic first choices, not ISA requirements or a caller-saved-is-free rule.
+Other legal bindings are selected when those registers are live. `v0` is
+reserved for masks; group selection accounts for integer LMUL alignment and
+whole-group overlap. Group-reservation tests cover LMUL 1/2/4/8, but generated
+kernels remain e32/m1. Reservations release on success, error and unwinding.
+
+If a full safe reservation is unavailable, vectorization declines with an
+explicit scalar-fallback diagnostic. The kernel does not add stack saves.
+It declares its actual owned scratch and legitimate counter writes; `vl` and
+`vtype` are clobbered. This is a local composition contract, not global CFG/SSA
+liveness analysis, arbitrary inline-assembly support or a vector calling ABI.
+
+The scalar conflict resolver first relocates conflicting result registers into
+genuinely free destinations outside the consumer footprint, protected values
+and fixed bindings. Remaining scratch conflicts are renamed if possible, or
+their original physical registers are saved/restored in a verified frame.
+Results are never restored over. If no safe result destination exists, the
+compiler reports a register-conflict error rather than an unsafe swap or panic.
+Parallel input-renaming cycles use the existing guarded replacement helper.
+Disjoint input replacements are applied directly and do not consume guard
+registers; only chains/cycles use guarded staging.
+Multi-input binding first relocates non-input scratch/results away from the
+producer registers. Producer values are not fixed template roles before binding;
+only the template's declared placeholder inputs may be rebound in place. This
+prevents compound stores from overwriting their address and arithmetic indices
+from aliasing the dimension-multiplier scratch.
+
+### Checked function frames
+
+Stack allocation assigns naturally aligned base offsets with checked size and
+offset arithmetic. A byte array preceding an Int32 matrix now receives the
+necessary padding instead of making that matrix unaligned. Existing struct/union
+member layout is unchanged; this does not establish complete external C ABI
+layout compatibility.
+
+Before body generation, the compiler verifies every assigned local/parameter
+slot's size, alignment, FP-relative bounds and non-overlap across nested scopes.
+The body reserves the complete lowest-offset frame, rounded to 16 bytes, rather
+than summing only its immediate symbol table. Matrix addresses remain
+`fp + SymbolLocation::Stack(offset)`, not `sp` or an assumed argument position.
+Generic conflict saves require this verified frame and preserve 16-byte SP
+alignment and LIFO restoration. This covers frame ownership for these snippets,
+not a proof of the compiler's complete calling convention.
+Large in-place address adjustments use bounded `addi` chunks instead of
+clobbering their base with `lui`. SP chunks retain 16-byte alignment, including
+aliases. Complete frames above 2048 bytes are rejected explicitly: existing
+scalar FP-relative address/load templates cannot yet represent wider offsets.
+Such rejection is not counted as a passing executable.
 
 Build the resulting assembly through `riscv_asm_lib`, then run its ELF under
 an RVV-enabled QEMU CPU. Acceptance requires both observed guest exit 42/142
-and evidence that the actual ELF contains and executes the vector-add block.
+and evidence that the actual ELF contains and executes the selected vector block.
 An exit of 42 from a scalar-only build does not validate this optimization.
 Assembly serialization must retain the `vsetvli` configuration, vector masks
 and memory operands; the assembler has a parse/print/reparse regression for
-these fields. Matrix addressing and assignment lowering preserve live results
-rather than treating already-dead scalar temporaries as live values.
+these fields. The fixtures in `NomoLynx/test_code_data` cover 2D add (`test74.c`),
+asymmetric signed 2D subtraction and byte-prefix alignment (`test75.c`),
+nonuniform 2x3x5 add/subtract with partial vector tails (`test76.c`/`test77.c`),
+and a call following nested-scope allocation (`test78.c`). Inputs, all results,
+final indices and memory guards are checked independently of the vector operation.
 The lowering follows the [RISC-V V 1.0 specification](https://docs.riscv.org/reference/isa/v20260120/unpriv/v-st-ext.html).

@@ -16,6 +16,59 @@ use crate::languages::clang::CLangBuildParameters;
 
 pub type ScopeId = u32;
 
+#[derive(Debug, Clone, Copy)]
+pub enum VectorGroupSize {
+    M1,
+    M2,
+    M4,
+    M8,
+}
+
+impl VectorGroupSize {
+    fn registers(self) -> u8 {
+        match self {
+            Self::M1 => 1,
+            Self::M2 => 2,
+            Self::M4 => 4,
+            Self::M8 => 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorRegisterGroup {
+    first: u8,
+    size: VectorGroupSize,
+}
+
+impl VectorRegisterGroup {
+    pub fn name(&self) -> String {
+        format!("v{}", self.first)
+    }
+
+    pub fn registers(&self) -> RegisterSet {
+        (self.first..self.first + self.size.registers())
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScratchRegisters {
+    pub integer: Vec<String>,
+    pub vector: Vec<VectorRegisterGroup>,
+}
+
+impl ScratchRegisters {
+    pub fn registers(&self) -> RegisterSet {
+        self.vector.iter().fold(
+            self.integer.clone().into(),
+            |registers, group| registers + group.registers(),
+        )
+    }
+}
+
 state_type_mapping!("src/languages/clang/type_conversions.mmd", CodeGenContext);
 
 #[derive(Debug, Clone, Accessors)]
@@ -27,6 +80,9 @@ pub struct CodeGenContext {
     flip_boolean_expr : bool,
     ///available registres
     available_reg_names : RegisterSet,
+    live_registers : RegisterSet,
+    reserved_registers : RegisterSet,
+    verified_frame_bytes : Option<usize>,
     /// instruction mapping
     hash: HashMap<String, String>,
     
@@ -230,10 +286,11 @@ impl CodeGenContext {
     }
 
     pub fn get_available_register_as_registerset(&self) -> RegisterSet {
-        self.get_available_registers().into_iter()
+        RegisterSet::from(self.get_available_registers().into_iter()
             .map(|x| x.clone())
-            .collect::<Vec<_>>()
-            .into()
+            .collect::<Vec<_>>())
+            - self.live_registers.clone()
+            - self.reserved_registers.clone()
     }
 
     pub fn get_available_temp_float_registerset(&self) -> RegisterSet {
@@ -246,6 +303,114 @@ impl CodeGenContext {
         self.get_available_register_as_registerset()
             .get_temp_registers()
             .get_int_registers()
+    }
+
+    /// Values in this set must survive the child; inputs consumed by that child
+    /// are instead bound explicitly at their last use.
+    pub fn with_live_registers<F, T>(&mut self, registers: &RegisterSet, f: F) -> T
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        let old = self.live_registers.clone();
+        self.live_registers += registers.clone();
+        struct Restore<'a> {
+            context: &'a mut CodeGenContext,
+            old: RegisterSet,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.context.live_registers = self.old.clone();
+            }
+        }
+        let restore = Restore { context: self, old };
+        f(restore.context)
+    }
+
+    pub fn with_verified_frame<F, T>(&mut self, bytes: usize, f: F) -> T
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        let old = self.verified_frame_bytes.replace(bytes);
+        struct Restore<'a> {
+            context: &'a mut CodeGenContext,
+            old: Option<usize>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.context.verified_frame_bytes = self.old;
+            }
+        }
+        let restore = Restore { context: self, old };
+        f(restore.context)
+    }
+
+    fn select_scratch_registers(
+        &self,
+        integer_count: usize,
+        vector_count: usize,
+        group_size: VectorGroupSize,
+    ) -> Option<ScratchRegisters> {
+        let available = self.get_available_temp_integer_registerset().to_hashset();
+        let integer = (0..=6)
+            .map(|index| format!("t{index}"))
+            .filter(|name| available.contains(&RegisterUsage::new(name)))
+            .take(integer_count)
+            .collect::<Vec<_>>();
+        if integer.len() != integer_count {
+            return None;
+        }
+
+        let mut occupied = self.live_registers.clone() + self.reserved_registers.clone()
+            + RegisterSet::from("v0");
+        let mut vector = Vec::new();
+        let width = group_size.registers();
+        // Prefer the existing bindings, but never treat them as implicitly free.
+        for first in (8u8..32).chain(1..8) {
+            if vector.len() == vector_count {
+                break;
+            }
+            if first % width != 0 || first + width > 32 {
+                continue;
+            }
+            let group = VectorRegisterGroup { first, size: group_size };
+            let registers = group.registers();
+            if occupied.has_conflict(&registers) {
+                continue;
+            }
+            occupied += registers;
+            vector.push(group);
+        }
+        (vector.len() == vector_count).then_some(ScratchRegisters { integer, vector })
+    }
+
+    /// Reservations are atomic, exclude live values and v0, and release on
+    /// success, error or unwinding. Exhaustion declines the optimization.
+    pub fn with_scratch_registers<F, T>(
+        &mut self,
+        integer_count: usize,
+        vector_count: usize,
+        group_size: VectorGroupSize,
+        f: F,
+    ) -> Result<Option<T>, CLangError>
+    where
+        F: FnOnce(&mut Self, &ScratchRegisters) -> Result<T, CLangError>,
+    {
+        let Some(bindings) = self.select_scratch_registers(integer_count, vector_count, group_size) else {
+            return Ok(None);
+        };
+        let old = self.reserved_registers.clone();
+        self.reserved_registers += bindings.registers();
+        struct Restore<'a> {
+            context: &'a mut CodeGenContext,
+            old: RegisterSet,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.context.reserved_registers = self.old.clone();
+            }
+        }
+        let restore = Restore { context: self, old };
+        f(restore.context, &bindings).map(Some)
     }
 
     /// get available registers as register set by type, this happens on symbol type
@@ -575,6 +740,9 @@ impl Default for CodeGenContext {
             symbol_table_md_file_name: Some("clang_symbol_table.md".to_string()),
             flip_boolean_expr : false,
             available_reg_names : RegisterSet::new_from_string_vec(& regs),
+            live_registers : RegisterSet::default(),
+            reserved_registers : RegisterSet::default(),
+            verified_frame_bytes : None,
             const_expresion_on_left : false,
             a0_parameter_clobbered_by_call_return : false,
             tanry_dots_following : false,
@@ -626,3 +794,75 @@ impl Default for IterationResult {
         }
     }
 }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn scratch_reservations_preserve_live_values_and_release_on_error() {
+            let mut context = CodeGenContext::default();
+            let live = RegisterSet::from("t0, x6, v8, v11");
+            context.with_live_registers(&live, |context| {
+                let result: Result<Option<()>, CLangError> = context.with_scratch_registers(
+                    5, 3, VectorGroupSize::M1, |context, bindings| {
+                        assert_eq!(bindings.integer, ["t2", "t3", "t4", "t5", "t6"]);
+                        assert_eq!(bindings.vector.iter().map(|group| group.name()).collect::<Vec<_>>(),
+                            ["v9", "v10", "v12"]);
+                        assert!(!bindings.registers().has_conflict(&live));
+                        assert!(!context.get_available_temp_integer_registerset().has_conflict(&bindings.registers()));
+                        Err(CLangError::cannot_emit("reservation error control"))
+                    }
+                );
+                assert!(result.is_err());
+                assert!(context.get_reserved_registers().is_empty());
+                let bindings = context.with_scratch_registers(5, 3, VectorGroupSize::M1,
+                    |_, bindings| Ok(bindings.clone())).unwrap().unwrap();
+                assert!(!bindings.registers().has_conflict(&live));
+            });
+            assert!(context.get_live_registers().is_empty());
+            assert!(context.get_reserved_registers().is_empty());
+        }
+
+        #[test]
+        fn scratch_exhaustion_is_atomic_and_nested_groups_do_not_overlap() {
+            let mut context = CodeGenContext::default();
+            context.with_live_registers(&RegisterSet::from("t0, t1, t2"), |context| {
+                let result = context.with_scratch_registers(5, 3, VectorGroupSize::M1,
+                    |_, _| Ok(()));
+                assert!(result.unwrap().is_none());
+                assert!(context.get_reserved_registers().is_empty());
+            });
+            context.with_scratch_registers(3, 1, VectorGroupSize::M2, |context, outer| {
+                assert!(context.with_scratch_registers(5, 0, VectorGroupSize::M1,
+                    |_, _| Ok(())).unwrap().is_none());
+                context.with_scratch_registers(1, 1, VectorGroupSize::M2, |_, inner| {
+                    assert!(!outer.registers().has_conflict(&inner.registers()));
+                    Ok(())
+                })?;
+                assert_eq!(*context.get_reserved_registers(), outer.registers());
+                Ok(())
+            }).unwrap().unwrap();
+            assert!(context.get_reserved_registers().is_empty());
+        }
+
+        #[test]
+        fn vector_groups_obey_lmul_alignment_mask_and_overlap_constraints() {
+            let mut context = CodeGenContext::default();
+            for size in [VectorGroupSize::M1, VectorGroupSize::M2, VectorGroupSize::M4, VectorGroupSize::M8] {
+                context.with_scratch_registers(0, 3, size, |_, bindings| {
+                    let mut used = RegisterSet::from("v0");
+                    for group in &bindings.vector {
+                        assert_eq!(group.first % size.registers(), 0);
+                        assert!(!used.has_conflict(&group.registers()));
+                        used += group.registers();
+                    }
+                    Ok(())
+                }).unwrap().unwrap();
+            }
+            context.with_live_registers(&RegisterSet::from("v15"), |context| {
+                assert!(context.with_scratch_registers(0, 3, VectorGroupSize::M8,
+                    |_, _| Ok(())).unwrap().is_none());
+            });
+        }
+    }

@@ -294,7 +294,7 @@ impl CLangProgram {
     }
 
     /// assign registers
-    pub fn assign_registers(&mut self, context:&mut CodeGenContext) {
+    pub fn assign_registers(&mut self, context:&mut CodeGenContext) -> Result<(), CLangError> {
         let ast_item = self.get_ast_item_mut();
 
         let mut iteration_context = ast_item.into();
@@ -303,16 +303,24 @@ impl CLangProgram {
            true
         };
 
+        let mut error = None;
         let visit = &mut |n:&mut ASTItem, _context0:&mut ASTItemIterationContext| {
-            if n.is_scope_element() {
+            if error.is_none() && n.is_scope_element() {
                 let scope_item = n.get_scope_item().unwrap();
-                scope_item.assgin_var_register(context);
-                scope_item.assign_parameter_register(context);
+                if let Err(failure) = scope_item.assgin_var_register(context)
+                    .and_then(|_| scope_item.assign_parameter_register(context))
+                {
+                    error = Some(failure);
+                }
             }
         };
         
         // assign register is from bottom to top, so post order is required.
         ast_item.postorder_tree_mut(&mut iteration_context, visit, child_can_visit);
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// get and set types for each variables in the program

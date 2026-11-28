@@ -376,8 +376,8 @@ impl CodeSnippet {
         r 
     }
 
-    /// get contaminated registers from the code snippet: the output register, temp registers, and impacted registers,
-    /// and also the contaminated registers from inside snippets
+    /// Conservative effects, not a live-out set: outputs, scratch and semantic
+    /// writes, including child effects. Their values need not survive this snippet.
     pub fn get_contaminated_registers(&self) -> RegisterSet {
         let mut r = self.get_output_register_as_registerset();
         r += RegisterSet::new_from_string_vec(self.get_impacted_regs());
@@ -391,6 +391,12 @@ impl CodeSnippet {
         }
 
         r
+    }
+
+    /// A local producer/consumer boundary preserves results plus values owned
+    /// by an enclosing computation, not every dead producer scratch value.
+    pub fn live_outputs_with(&self, live_through: &RegisterSet) -> RegisterSet {
+        self.get_output_register_as_registerset() + live_through.clone()
     }
 
     /// get all registers used in the code snippet, including input, output, temp, and impacted registers
@@ -559,20 +565,11 @@ impl CodeSnippet {
         len == 1
     }
 
-    fn respect_fixed_regs(&self, _other_regs:&RegisterSet, fixed_regs:&RegisterSet) -> bool {
-        let is_single_instruction = self.is_single_instruction_code_snippet();
-        let has_same_defined_regs = self.get_all_registers_defined() == *fixed_regs;
-        is_single_instruction || has_same_defined_regs
-    }
-
     /// move registers from regs (RegisterSet) to avoid conflict, 
     /// regs are the registers used by other code snippets and split into int and float registers
     /// fixed_regs are caller-selected registers that must not be moved during conflict resolution.
     pub fn move_register_from(&mut self, regs:RegisterSet, fixed_regs:RegisterSet, context:&mut CodeGenContext) -> Result<(), CLangError> {
-        let respect_fixed_regs = self.respect_fixed_regs(&regs, &fixed_regs);
-        let fixed_regs = if respect_fixed_regs { fixed_regs } 
-                                    else { [].into() };
-        
+        let regs = regs + context.get_live_registers().clone();
         let (int_regs, float_regs) = regs.get_int_float_registers();
         if int_regs.len() > 0 {
             self.move_int_register_from(int_regs, fixed_regs.clone(), context)?;
@@ -594,7 +591,10 @@ impl CodeSnippet {
         let self_regset = self.get_all_registers().get_float_registers();
         let fixed_regs = self.get_fixed_reg_as_regset().get_float_registers() + fixed_regs.get_float_registers();
         let protected_regs = self.get_output_register_as_registerset().get_float_registers();
-        let (replacements, reg_to_push) = self_regset.move_away_from(&regs, &available_regset, &fixed_regs, &protected_regs);
+        let (replacements, reg_to_push) = self_regset.move_away_from(&regs, &available_regset, &fixed_regs, &protected_regs)?;
+        if !reg_to_push.is_empty() && context.get_verified_frame_bytes().is_none() {
+            return Err(CLangError::cannot_emit("Register spills require a verified function frame"));
+        }
 
         for n in replacements.iter() {
             self.perform_registerset_action(n);
@@ -611,29 +611,16 @@ impl CodeSnippet {
                                     .join(", ");
             let mut push_code = CodeSnippet::new_with_debug_info("push float registers", format!("push float registers to avoid conflict: [{reg_names_str}] => [{replacement_str}]").as_str());
             let mut pop_code = CodeSnippet::new_with_debug_info("pop float registers", format!("pop float registers to avoid conflict: [{reg_names_str}] => [{replacement_str}]").as_str());
+            if reg_to_push.len() % 2 != 0 {
+                push_code.add_snippet(CodeSnippet::from_asm_code_str("spill alignment", ".text\naddi sp, sp, -8\n")?);
+            }
             let mut regs_to_restore = Vec::new();
             for reg in reg_to_push.get_register_alias_name() {
-                let mapped_reg = replacements.iter()
-                    .filter(|x| x.is_replace_action())
-                    .find_map(|n| {
-                        let (old, new) = n.to_tuple();
-                        let old_usage = RegisterUsage::new(&old);
-                        let reg_usage = reg.as_str().into();
-                        if old_usage == reg_usage { Some(RegisterUsage::new(&new).get_reg_alias().to_string())}
-                        else { None }
-                    })
-                    .unwrap_or_else(|| reg.clone());
-
-                let reg_to_save = if output_reg_aliases.contains(&mapped_reg) {
-                    reg.clone()
-                }
-                else {
-                    mapped_reg
-                };
+                let reg_to_save = reg;
 
                 assert!(
                     !output_reg_aliases.contains(&reg_to_save),
-                    "destination/output register must not be part of conflict save/restore set. output={output_reg_aliases:?}, spill={reg_to_save}, original={reg}, replacements={replacements:?}"
+                    "destination/output register must not be part of conflict save/restore set. output={output_reg_aliases:?}, spill={reg_to_save}, replacements={replacements:?}"
                 );
 
                 push_code.add_asm_inc("pushf64", vec![Some(&reg_to_save)])?;
@@ -643,6 +630,9 @@ impl CodeSnippet {
             // Stack restore must be reverse of save order (LIFO).
             for reg in regs_to_restore.iter().rev() {
                 pop_code.add_asm_inc("popf64", vec![Some(reg.as_str())])?;
+            }
+            if reg_to_push.len() % 2 != 0 {
+                pop_code.add_snippet(CodeSnippet::from_asm_code_str("restore spill alignment", ".text\naddi sp, sp, 8\n")?);
             }
 
             self.insert_at_beginning(vec![push_code]);
@@ -663,7 +653,10 @@ impl CodeSnippet {
         let self_regset = self.get_all_registers().get_int_registers();
         let fixed_regs = self.get_fixed_reg_as_regset().get_int_registers() + fixed_regs.get_int_registers();
         let protected_regs = self.get_output_register_as_registerset().get_int_registers();
-        let (replacements, reg_to_push) = self_regset.move_away_from(&regs, &available_regset, &fixed_regs, &protected_regs);
+        let (replacements, reg_to_push) = self_regset.move_away_from(&regs, &available_regset, &fixed_regs, &protected_regs)?;
+        if !reg_to_push.is_empty() && context.get_verified_frame_bytes().is_none() {
+            return Err(CLangError::cannot_emit("Register spills require a verified function frame"));
+        }
 
         for n in replacements.iter() {
             self.perform_registerset_action(n);
@@ -680,29 +673,16 @@ impl CodeSnippet {
                                             .join(", ");
             let mut push_code = CodeSnippet::new_with_debug_info("push int registers", format!("push int registers to avoid conflict: [{reg_names_str}] => [{replacement_str}]").as_str());
             let mut pop_code = CodeSnippet::new_with_debug_info("pop int registers", format!("pop int registers to avoid conflict: [{reg_names_str}] => [{replacement_str}]").as_str());
+            if reg_to_push.len() % 2 != 0 {
+                push_code.add_snippet(CodeSnippet::from_asm_code_str("spill alignment", ".text\naddi sp, sp, -8\n")?);
+            }
             let mut regs_to_restore = Vec::new();
             for reg in reg_to_push.get_register_alias_name() {
-                let mapped_reg = replacements.iter()
-                    .filter(|x| x.is_replace_action())
-                    .find_map(|n| {
-                        let (old, new) = n.to_tuple();
-                        let old_usage = RegisterUsage::new(&old);
-                        let reg_usage = reg.as_str().into();
-                        if old_usage == reg_usage { Some(RegisterUsage::new(&new).get_reg_alias().to_string())}
-                        else { None }
-                    })
-                    .unwrap_or_else(|| reg.clone());
-
-                let reg_to_save = if output_reg_aliases.contains(&mapped_reg) {
-                    reg.clone()
-                }
-                else {
-                    mapped_reg
-                };
+                let reg_to_save = reg;
 
                 assert!(
                     !output_reg_aliases.contains(&reg_to_save),
-                    "destination/output register must not be part of conflict save/restore set. output={output_reg_aliases:?}, spill={reg_to_save}, original={reg}, replacements={replacements:?}"
+                    "destination/output register must not be part of conflict save/restore set. output={output_reg_aliases:?}, spill={reg_to_save}, replacements={replacements:?}"
                 );
 
                 push_code.add_asm_inc("push64", vec![Some(&reg_to_save)])?;
@@ -712,6 +692,9 @@ impl CodeSnippet {
             // Stack restore must be reverse of save order (LIFO).
             for reg in regs_to_restore.iter().rev() {
                 pop_code.add_asm_inc("pop64", vec![Some(reg.as_str())])?;
+            }
+            if reg_to_push.len() % 2 != 0 {
+                pop_code.add_snippet(CodeSnippet::from_asm_code_str("restore spill alignment", ".text\naddi sp, sp, 8\n")?);
             }
 
             self.insert_at_beginning(vec![push_code]);
@@ -815,6 +798,14 @@ impl CodeSnippet {
 
         //replace required input register names
         for item in self.required_input_register_names.iter_mut() {
+            if item == old.get_reg_name() || old.get_reg_alias() == item {
+                *item = new.get_reg_alias().to_string();
+            }
+        }
+        for item in self.required_temporary_register_names.iter_mut()
+            .chain(self.impacted_regs.iter_mut())
+            .chain(self.fixed_regs.iter_mut())
+        {
             if item == old.get_reg_name() || old.get_reg_alias() == item {
                 *item = new.get_reg_alias().to_string();
             }
@@ -1231,12 +1222,13 @@ impl CodeSnippet {
             .cloned()
             .collect::<Vec<_>>();
 
-        // do not need to check conflict if self.input_reg conflict with other's output reg, 
-        // because self.input_reg will be replaced with other's output reg, 
-        // so the conflict will be resolved by replacement. 
-        // But if self's other registers conflict with other's output reg, 
-        // then need to move away self's other registers to avoid conflict before calling this function
-        // the self.input number same as the snippets' output number, so input reg no need to be checked for conflict
+        // Placeholder inputs may be rebound in place. Scratch/output roles that
+        // are not inputs must move away before the producers' values are bound.
+        self.move_register_from(
+            RegisterSet::new_from_string_vec(&registers),
+            self.get_input_register_as_registerset(),
+            context,
+        )?;
         let replacements = self.get_input_register_names().iter().zip(registers.iter())
                                                             .map(|(a, b)| (a.to_string(), b.to_string()))
                                                             .collect::<Vec<_>>(); 
@@ -1253,6 +1245,14 @@ impl CodeSnippet {
             .collect::<Vec<_>>();
 
         if replacements.is_empty() {
+            return Ok(());
+        }
+
+        let needs_guard = replacements.iter().any(|(_, new)| {
+            replacements.iter().any(|(old, _)| RegisterUsage::new(new) == RegisterUsage::new(old))
+        });
+        if !needs_guard {
+            self.replace_register_with(replacements);
             return Ok(());
         }
 
@@ -1533,6 +1533,143 @@ impl Debug for CodeSnippet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_spills_preserve_results_and_keep_stack_alignment() {
+        let mut context = CodeGenContext::default();
+        context.set_available_reg_names(RegisterSet::from("t0, t1, t2"));
+        let mut code = CodeSnippet::from_asm_code_str(
+            "pressure", ".text\nli t0, 7\nadd t1, t1, t0\n"
+        ).unwrap();
+        code.set_output_register_names(vec!["t0".to_string()]);
+        code.set_temp_register_names(vec!["t1".to_string()]);
+        assert!(code.clone().move_register_from(
+            RegisterSet::from("t0, t1"), RegisterSet::default(), &mut context
+        ).is_err(), "unverified frames must not spill");
+        context.with_verified_frame(16, |context| {
+            code.move_register_from(RegisterSet::from("t0, t1"), RegisterSet::default(), context)
+        }).unwrap();
+        assert_eq!(code.get_output_register_as_registerset(), RegisterSet::from("t2"));
+        let text = code.generate_code_string();
+        assert!(text.contains("push64 t1") && text.contains("pop64 t1"), "{text}");
+        assert!(!text.contains("push64 t0") && !text.contains("pop64 t2"), "{text}");
+        assert!(text.contains("addi sp, sp, -8") && text.contains("addi sp, sp, 8"), "{text}");
+    }
+
+    #[test]
+    fn compound_snippets_keep_explicit_in_place_bindings() {
+        let mut context = CodeGenContext::default();
+        let mut code = CodeSnippet::from_asm_code_str(
+            "in-place", ".text\nli t2, 7\nadd t0, t0, t2\n"
+        ).unwrap();
+        code.set_output_register_names(vec!["t0".to_string()]);
+        code.set_input_register_names(vec!["t0".to_string()]);
+        code.move_register_from(RegisterSet::from("t0"), RegisterSet::from("t0"), &mut context)
+            .unwrap();
+        assert!(code.generate_code_string().contains("add t0, t0, t2"));
+    }
+
+    #[test]
+    fn parallel_register_cycles_do_not_destroy_source_operands() {
+        let mut context = CodeGenContext::default();
+        let mut code = CodeSnippet::from_asm_code_str(
+            "ordered operands", ".text\nsub t0, t1, t2\n"
+        ).unwrap();
+        code.set_input_register_names(vec!["t1".to_string(), "t2".to_string()]);
+        code.set_output_register_names(vec!["t0".to_string()]);
+        context.with_live_registers(&RegisterSet::from("t3, t4"), |context| {
+            code.replace_register_with_temp_guard(vec![
+                ("t1".to_string(), "t2".to_string()),
+                ("t2".to_string(), "t1".to_string()),
+            ], context)
+        }).unwrap();
+        assert!(code.generate_code_string().contains("sub t0, t2, t1"));
+    }
+
+    #[test]
+    fn multiple_input_binding_separates_compound_assignment_scratch() {
+        fn memory_bases(code: &CodeSnippet, bases: &mut Vec<RegisterUsage>) {
+            for item in code.get_code_items() {
+                match item {
+                    CodeSnippetDataItem::Inc(section) => {
+                        if let Some(instruction) = section.get_inc() {
+                            let name = instruction.get_name().to_ascii_lowercase();
+                            if name == "lw" || name == "sw" || name == "flw" || name == "fsw" {
+                                bases.push(RegisterUsage::new(instruction.get_r1().unwrap()));
+                            }
+                        }
+                    }
+                    CodeSnippetDataItem::Snippet(child) => memory_bases(child, bases),
+                    _ => {}
+                }
+            }
+        }
+        let mut context = CodeGenContext::default();
+        for float in [false, true] {
+            let mut template = CodeSnippet::from_asm_code_str("compound assignment",
+                if float {
+                    ".text\nflw ft0, 0(t1)\nfsub.s ft0, ft0, ft1\nfsw ft0, 0(t1)\n"
+                } else {
+                    ".text\nlw t0, 0(t1)\nsub t0, t0, t2\nsw t0, 0(t1)\n"
+                }).unwrap();
+            template.set_input_register_names(vec!["t1".to_string(),
+                if float { "ft1" } else { "t2" }.to_string()]);
+            template.set_temp_register_names(vec![if float { "ft0" } else { "t0" }.to_string()]);
+            let mut address = CodeSnippet::new("address");
+            address.set_output_register_names(vec!["t0".to_string()]);
+            let mut value = CodeSnippet::new("value");
+            value.set_output_register_names(vec![if float { "ft0" } else { "t3" }.to_string()]);
+            let producers = address.get_output_register_as_registerset() + value.get_output_register_as_registerset();
+            template.move_register_from(producers.clone(), producers, &mut context).unwrap();
+            template.get_input_registers_from(vec![&address, &value], &mut context).unwrap();
+            assert!(!template.get_temp_register_as_registerset().has_conflict(
+                &template.get_input_register_as_registerset()), "{}", template.generate_code_string());
+            let mut bases = Vec::new();
+            memory_bases(&template, &mut bases);
+            assert_eq!(bases.len(), 2, "{}", template.generate_code_string());
+            for base in bases {
+                assert_eq!(base, RegisterUsage::new("t0"));
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_input_binding_keeps_arithmetic_index_out_of_dimension_scratch() {
+        let mut context = CodeGenContext::default();
+        let mut index = CodeSnippet::from_asm_code_str("offset_from_array_index",
+            ".text\nli t2, 4\nmul t0, t0, t2\nadd t0, t0, t1\n").unwrap();
+        index.set_input_register_names(vec!["t0".to_string(), "t1".to_string()]);
+        index.set_output_register_names(vec!["t0".to_string()]);
+        index.set_temp_register_names(vec!["t2".to_string()]);
+        let mut previous = CodeSnippet::new("previous offset");
+        previous.set_output_register_names(vec!["t0".to_string()]);
+        let mut arithmetic = CodeSnippet::new("i plus one");
+        arithmetic.set_output_register_names(vec!["t2".to_string()]);
+        index.get_input_registers_from(vec![&previous, &arithmetic], &mut context).unwrap();
+        assert!(!index.get_temp_register_as_registerset().has_conflict(&RegisterSet::from("t2")),
+            "{}", index.generate_code_string());
+        assert!(index.generate_code_string().contains("add t0, t0, t2"));
+    }
+
+    #[test]
+    fn disjoint_case_input_binding_does_not_require_guard_registers() {
+        let mut context = CodeGenContext::default();
+        let mut template = CodeSnippet::from_asm_code_str("case compound assignment",
+            ".text\nlw t0, 0(t1)\nadd t0, t0, t2\nsw t0, 0(t1)\n").unwrap();
+        template.set_input_register_names(vec!["t1".to_string(), "t2".to_string()]);
+        template.set_temp_register_names(vec!["t0".to_string()]);
+        let mut address = CodeSnippet::new("address");
+        address.set_output_register_names(vec!["t0".to_string()]);
+        let mut value = CodeSnippet::new("value");
+        value.set_output_register_names(vec!["t3".to_string()]);
+        context.with_live_registers(&RegisterSet::from("t1, t3"), |context| {
+            let producers = RegisterSet::from("t0, t3");
+            template.move_register_from(producers.clone(), producers, context)?;
+            template.get_input_registers_from(vec![&address, &value], context)
+        }).unwrap();
+        assert_eq!(template.get_input_register_as_registerset(), RegisterSet::from("t0, t3"));
+        assert!(!template.get_temp_register_as_registerset().has_conflict(&RegisterSet::from("t0, t1, t3")));
+    }
 
     #[test]
     fn get_input_registers_from_does_not_cascade_replacements() {

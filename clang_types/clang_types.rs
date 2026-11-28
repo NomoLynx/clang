@@ -476,12 +476,10 @@ impl CLangTypes {
                                         .and_then(|x| Some(x.get_type_size(config))),
             CLangTypes::Enum(_, _) => self.get_enum().and_then(|x| Some(x.get_type_size(config))),
             CLangTypes::Array(ty, _, dimenstion) => {
-                if let Some(n) = ty.get_type_size_in_bytes2(config) {
-                    Some(n * dimenstion.get_total_elements())
-                }
-                else {
-                    None
-                }
+                dimenstion.get_dimensions_values().iter().try_fold(
+                    ty.get_type_size_in_bytes2(config)?,
+                    |size, dimension| size.checked_mul(*dimension),
+                )
             }
             CLangTypes::TypeAlias(_, n) => {
                 n.as_ref().
@@ -490,6 +488,21 @@ impl CLangTypes {
             CLangTypes::Void => Some(config.get_addressing_in_bytes() as usize),
             CLangTypes::Invalid |
             CLangTypes::None => None,
+        }
+    }
+
+    pub fn get_stack_alignment_in_bytes(&self, context: &CodeGenContext) -> Option<usize> {
+        match self {
+            Self::Array(element, _, _) => element.get_stack_alignment_in_bytes(context),
+            Self::TypeAlias(_, real) => real.as_deref()?.get_stack_alignment_in_bytes(context),
+            Self::Struct(_, _) | Self::Union(_, _) => {
+                let alignments = self.get_composite_type_symbol_table()?.get_all_entries().iter()
+                    .filter_map(|entry| entry.get_data_type())
+                    .map(|ty| ty.get_stack_alignment_in_bytes(context))
+                    .collect::<Option<Vec<_>>>()?;
+                alignments.into_iter().max()
+            }
+            _ => self.get_type_size_in_bytes(context).filter(|size| size.is_power_of_two()),
         }
     }
 

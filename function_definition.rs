@@ -242,7 +242,7 @@ impl FunctionDefinition {
         // add parameters to symbol table
         for (i, var_name) in parameter.iter().enumerate() {
             let parameter_reg_nubmer = reg_number as usize;
-            stack_frame_pointer -= addressing_bytes as i32;
+            stack_frame_pointer = aligned_stack_offset(stack_frame_pointer, addressing_bytes as usize, addressing_bytes as usize)?;
             if i >= parameter_reg_nubmer {
                 symbol_table.set_parameter_storage_location(&var_name, SymbolLocation::Stack(stack_frame_pointer))?;
             }
@@ -261,6 +261,104 @@ impl FunctionDefinition {
 
     pub fn set_stack_frame_pointer(&mut self, value:i32) {
         self.stack_frame_pointer = value;
+    }
+
+    pub fn checked_frame_size(&self, context: &CodeGenContext) -> Result<usize, CLangError> {
+        fn collect_table(
+            table: &SymbolTable,
+            context: &CodeGenContext,
+            bottom: i32,
+            slots: &mut Vec<(i64, i64, String)>,
+        ) -> Result<(), CLangError> {
+            for entry in table.get_all_entries() {
+                if !matches!(entry.get_symbol_type(), SymbolType::Var | SymbolType::Declaration) {
+                    continue;
+                }
+                for location in entry.get_storage_location() {
+                    let offset = match location {
+                        SymbolLocation::Stack(offset) | SymbolLocation::RegisterAndStack(_, offset) => *offset,
+                        _ => continue,
+                    };
+                    let (size, alignment) = if entry.get_symbol_type() == &SymbolType::Declaration {
+                        let bytes = context.get_code_gen_config().get_addressing_in_bytes() as usize;
+                        (bytes, bytes)
+                    } else {
+                        let ty = entry.get_data_type()
+                            .ok_or_else(|| CLangError::cannot_emit("Stack slot has no type"))?;
+                        (
+                            ty.get_type_size_in_bytes(context)
+                                .ok_or_else(|| CLangError::cannot_emit("Stack slot size is unknown"))?,
+                            ty.get_stack_alignment_in_bytes(context)
+                                .ok_or_else(|| CLangError::cannot_emit("Stack slot alignment is unknown"))?,
+                        )
+                    };
+                    let start = i64::from(offset);
+                    let size = i64::try_from(size)
+                        .map_err(|_| CLangError::cannot_emit("Stack slot size overflow"))?;
+                    let alignment = i64::try_from(alignment)
+                        .map_err(|_| CLangError::cannot_emit("Stack slot alignment overflow"))?;
+                    let end = start.checked_add(size)
+                        .ok_or_else(|| CLangError::cannot_emit("Stack slot end overflow"))?;
+                    if size == 0 || alignment <= 0 || start < i64::from(bottom)
+                        || end > 0 || start.rem_euclid(alignment) != 0
+                    {
+                        return Err(CLangError::cannot_emit(&format!(
+                            "Invalid frame slot {}: [{start}, {end}), alignment {alignment}, bottom {bottom}",
+                            entry.get_name()
+                        )));
+                    }
+                    slots.push((start, end, entry.get_name().to_string()));
+                }
+            }
+            for child in table.get_sub_tables() {
+                collect_table(child, context, bottom, slots)?;
+            }
+            Ok(())
+        }
+
+        fn collect_children(
+            ast: &ASTItem,
+            context: &CodeGenContext,
+            bottom: i32,
+            slots: &mut Vec<(i64, i64, String)>,
+        ) -> Result<(), CLangError> {
+            for child in ast.get_scope_children() {
+                if let Some(scope) = child.get_scope_trait() {
+                    collect_table(scope.get_symbol_table(), context, bottom, slots)?;
+                }
+                collect_children(child.get_ast_item(), context, bottom, slots)?;
+            }
+            Ok(())
+        }
+
+        let bottom = self.get_stack_frame_pointer();
+        if bottom > 0 {
+            return Err(CLangError::cannot_emit("Function frame bottom must not exceed fp"));
+        }
+        let mut slots = Vec::new();
+        collect_table(self.get_symbol_table(), context, bottom, &mut slots)?;
+        collect_children(self.get_ast_item(), context, bottom, &mut slots)?;
+        slots.sort_by_key(|slot| slot.0);
+        for pair in slots.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(CLangError::cannot_emit(&format!(
+                    "Overlapping frame slots {} and {}", pair[0].2, pair[1].2
+                )));
+            }
+        }
+        let bytes = usize::try_from(-i64::from(bottom))
+            .map_err(|_| CLangError::cannot_emit("Function frame size overflow"))?;
+        let aligned = bytes.checked_add(15)
+            .map(|bytes| bytes & !15)
+            .ok_or_else(|| CLangError::cannot_emit("Aligned function frame size overflow"))?;
+        if aligned > 2048 {
+            return Err(CLangError::cannot_emit(
+                "Function frame exceeds 2048 bytes; scalar FP-relative templates require signed 12-bit offsets"
+            ));
+        }
+        i32::try_from(aligned)
+            .map_err(|_| CLangError::cannot_emit("Function frame exceeds the supported offset range"))?;
+        Ok(aligned)
     }
 
     pub fn get_children(&mut self) -> Vec<CLangItem> {

@@ -32,6 +32,24 @@ pub fn gen_add_offset(rd: &str, rs1: &str, offset: isize) -> String {
         );
     }
 
+    let destination = crate::languages::clang::clang_asm_code_gen::RegisterUsage::new(rd);
+    let source = crate::languages::clang::clang_asm_code_gen::RegisterUsage::new(rs1);
+    if destination == source {
+        let positive_chunk = if destination == crate::languages::clang::clang_asm_code_gen::RegisterUsage::new("sp") {
+            2032
+        } else {
+            ADDI_MAX
+        };
+        let mut remaining = offset;
+        let mut instructions = Vec::new();
+        while remaining != 0 {
+            let chunk = remaining.clamp(ADDI_MIN, positive_chunk);
+            instructions.push(format!("addi {rd}, {rd}, {chunk}"));
+            remaining -= chunk;
+        }
+        return instructions.join("\n");
+    }
+
     // Otherwise: use lui + addi
     // RISC-V rule: addi sign-extends, so low 12 bits must be signed
     let offset = offset as isize;

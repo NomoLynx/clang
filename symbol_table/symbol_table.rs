@@ -11,6 +11,18 @@ use super::*;
 /// The attribute key for variable type in symbol table entries, it mainly used for parameters
 pub const ATTRIBUTE_KEY_VARTYPE: &str = "VARTYPE";
 
+pub(crate) fn aligned_stack_offset(current: i32, size: usize, alignment: usize) -> Result<i32, CLangError> {
+    if size == 0 || !alignment.is_power_of_two() {
+        return Err(CLangError::cannot_emit("Stack objects require nonzero size and power-of-two alignment"));
+    }
+    let size = i32::try_from(size).map_err(|_| CLangError::cannot_emit("Stack object size exceeds the supported frame range"))?;
+    let alignment = i32::try_from(alignment).map_err(|_| CLangError::cannot_emit("Stack object alignment exceeds the supported frame range"))?;
+    let end = current.checked_sub(size)
+        .ok_or_else(|| CLangError::cannot_emit("Stack frame offset overflow"))?;
+    end.checked_sub(end.rem_euclid(alignment))
+        .ok_or_else(|| CLangError::cannot_emit("Aligned stack frame offset overflow"))
+}
+
 /// Represents a CLang symbol table
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolTable {
@@ -366,7 +378,7 @@ impl SymbolTable {
     }
 
     /// assign registers to variables in the symbol table
-    pub fn assgin_var_register(&mut self, context:&mut CodeGenContext) {
+    pub fn assgin_var_register(&mut self, context:&mut CodeGenContext) -> Result<(), CLangError> {
         let used_registers = self.get_used_registers();
         let register_info = self.to_register_uses();
 
@@ -375,7 +387,7 @@ impl SymbolTable {
 
         let container = function_clang_item.get_ast_item();
         if container.is_clang_program_item() {
-            return;
+            return Ok(());
         }
         
         let container_function_option = container.get_current_function();
@@ -416,8 +428,11 @@ impl SymbolTable {
                     else {
                         // assign the variable to stack if no register available
                         if let Some(var_type) = variable_entry.get_data_type() {
-                            let data_size = var_type.get_type_size_in_bytes(context).unwrap();
-                            stack_frame_pointer -= data_size as i32;
+                            let data_size = var_type.get_type_size_in_bytes(context)
+                                .ok_or_else(|| CLangError::cannot_emit("Cannot determine stack object size"))?;
+                            let alignment = var_type.get_stack_alignment_in_bytes(context)
+                                .ok_or_else(|| CLangError::cannot_emit("Cannot determine stack object alignment"))?;
+                            stack_frame_pointer = aligned_stack_offset(stack_frame_pointer, data_size, alignment)?;
                             variable_entry.set_storage_location(SymbolLocation::Stack(stack_frame_pointer));
                         }
                         else {
@@ -429,8 +444,11 @@ impl SymbolTable {
             else {
                 // assign the variable to stack if no register available
                 if let Some(var_type) = variable_entry.get_data_type() {
-                    let data_size = var_type.get_type_size_in_bytes(context).unwrap();
-                    stack_frame_pointer -= data_size as i32;
+                    let data_size = var_type.get_type_size_in_bytes(context)
+                        .ok_or_else(|| CLangError::cannot_emit("Cannot determine stack object size"))?;
+                    let alignment = var_type.get_stack_alignment_in_bytes(context)
+                        .ok_or_else(|| CLangError::cannot_emit("Cannot determine stack object alignment"))?;
+                    stack_frame_pointer = aligned_stack_offset(stack_frame_pointer, data_size, alignment)?;
                     variable_entry.set_storage_location(SymbolLocation::Stack(stack_frame_pointer));
                 }
                 else {
@@ -440,6 +458,7 @@ impl SymbolTable {
         }
 
         container_function.set_stack_frame_pointer(stack_frame_pointer);
+        Ok(())
     }
 
     /// check whether the container of the symbol table is struct or union

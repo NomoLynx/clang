@@ -3,6 +3,7 @@ use std::ops::{Add, AddAssign, Index, Mul, Sub};
 
 use crate::languages::clang::clang_asm_code_gen::register_usage::RegisterUsage;
 use crate::languages::clang::clang_types::CLangTypes;
+use crate::languages::clang::CLangError;
 
 #[derive(Debug, Clone)]
 pub enum RegisterSetReplacementItemAction {
@@ -200,55 +201,41 @@ impl RegisterSet {
         r
     }
 
-    /// Move away registers in self that conflict with registers in b, considering fixed_regs that must not be moved.
-    /// protected_regs are registers that must not be used as spill/replacement slots either.
-    /// Returns (replacements for self's registers, registers that must be push/popped instead).
-    /// - conflicted registers that have a free slot get a rename replacement
-    /// - conflicted registers without a free slot are returned as spillover (caller must push/pop them)
-    pub fn move_away_from(&self, b: &Self, available_set: &Self, fixed_regs: &Self, protected_regs: &Self) -> (Vec<RegisterSetReplacementItem>, Self) {
+    /// Rebind results first to genuinely free registers. Other conflicts may
+    /// borrow their original register under save/restore; results never may.
+    /// Fixed registers retain the caller's explicit input/in-place binding.
+    pub fn move_away_from(&self, b: &Self, available_set: &Self, fixed_regs: &Self, protected_regs: &Self) -> Result<(Vec<RegisterSetReplacementItem>, Self), CLangError> {
         let conflicted_regs = self.clone() * b.clone() - fixed_regs.clone();
         if conflicted_regs.is_empty() {
-            return (vec![], Self::default());
+            return Ok((vec![], Self::default()));
         }
 
-        let mut free_regs = available_set.clone() - b.clone() - self.clone() - fixed_regs.clone() - protected_regs.clone();
-        let mut reg_to_push = Self::default();
-        if conflicted_regs.len() > free_regs.len() {
-            reg_to_push = conflicted_regs.clone() - free_regs.clone();
-            free_regs += reg_to_push.clone();
+        let free_regs = available_set.clone() - b.clone() - self.clone() - fixed_regs.clone() - protected_regs.clone();
+        let mut free_names = free_regs.get_register_alias_name();
+        free_names.sort();
+        let mut free_names = free_names.into_iter();
+        let output_conflicts = conflicted_regs.clone() * protected_regs.clone();
+        let mut output_names = output_conflicts.get_register_alias_name();
+        output_names.sort();
+        let mut replacements = Vec::new();
+        for old in output_names {
+            let new = free_names.next().ok_or_else(|| CLangError::RegisterConflictResolveErr(
+                format!("No safe destination for live result {old}; results cannot be restored over")
+            ))?;
+            replacements.push((old, new).into());
         }
 
-        let mut replacements = conflicted_regs.get_register_alias_name().into_iter()
-            .zip(free_regs.get_register_alias_name().into_iter())
-            .filter(|(m,n)| m != n)  // only keep replacements where the names differ
-            .map(|x| x.into())
-            .collect::<Vec<_>>();
-
-        // check if reg_to_push contains any protected registers
-        let protected_conflicts = reg_to_push.clone() * protected_regs.clone();
-        if !protected_conflicts.is_empty() {
-            // If there are protected registers in reg_to_push, we need to handle this case.
-            // candidate set does not need exclude reg_to_push, reg_to_push should be pushed to stack. it means registers in
-            // reg_to_push is protected and can be used freely between push-pop range.
-            let mut switch_candidate_regset = self.clone() - fixed_regs.clone() - protected_regs.clone();
-            switch_candidate_regset.retain_only_temp_registers(); // only keep temp registers for switching 
-            
-            if protected_conflicts.len() > switch_candidate_regset.len() {
-                panic!("Not enough candidate registers to switch with protected registers. Protected conflicts: {:?}, Switch candidates: {:?}", protected_conflicts, switch_candidate_regset);
+        let mut other_names = (conflicted_regs - output_conflicts).get_register_alias_name();
+        other_names.sort();
+        let mut spills = Self::default();
+        for old in other_names {
+            if let Some(new) = free_names.next() {
+                replacements.push((old, new).into());
+            } else {
+                spills.insert(RegisterUsage::new(&old));
             }
-
-            protected_conflicts.get_non_conflicting_pairs(&switch_candidate_regset)
-                .iter()
-                .for_each(|(old, new)| {
-                    replacements.push(RegisterSetReplacementItem::new(old.clone(), new.clone(), RegisterSetReplacementItemAction::Switch));
-                });
         }
-
-        (replacements, reg_to_push)
-    }
-
-    fn retain_only_temp_registers(&mut self) {
-        self.0.retain(|x| x.is_temp_register());
+        Ok((replacements, spills))
     }
 
     /// Get available RISC-V register names (t0-t6, s0-s11, ft0-ft11, fs0-fs11)
@@ -498,11 +485,32 @@ mod tests {
         let fixed = RegisterSet::default();
         let protected = RegisterSet::from(vec!["t0".to_string()]);
 
-        let (replacements, reg_to_push) = self_regs.move_away_from(&conflicted, &available, &fixed, &protected);
+        let (replacements, reg_to_push) = self_regs.move_away_from(&conflicted, &available, &fixed, &protected)
+            .expect("one free register can receive the result");
 
         assert!(!reg_to_push.get_register_alias_name().contains(&"t0".to_string()), 
                 "protected output register was selected for push/pop: {reg_to_push:?}");
-        assert!(replacements.iter().all(| x | x.old_reg != "t0" && x.new_reg != "t0"), 
-                "protected output register was used in replacements: {replacements:?}");
+        assert_eq!(replacements.iter().map(|item| item.to_tuple()).collect::<Vec<_>>(),
+            vec![("t0".to_string(), "t2".to_string())]);
+        assert_eq!(reg_to_push, RegisterSet::from("t1"));
+    }
+
+    #[test]
+    fn move_away_from_reports_exhaustion_instead_of_spilling_a_result() {
+        let registers = RegisterSet::from("t0, t1");
+        let result = registers.move_away_from(&registers, &registers,
+            &RegisterSet::default(), &RegisterSet::from("t0"));
+        assert!(matches!(result, Err(CLangError::RegisterConflictResolveErr(_))));
+    }
+
+    #[test]
+    fn move_away_from_preserves_fixed_bindings_and_normalizes_aliases() {
+        let (renames, spills) = RegisterSet::from("x5, t1, t2").move_away_from(
+            &RegisterSet::from("t0, x6"), &RegisterSet::from("t0, t1, t2, t3"),
+            &RegisterSet::from("t0"), &RegisterSet::from("t0, t1")
+        ).expect("t3 is free for t1's result");
+        assert_eq!(renames.iter().map(|item| item.to_tuple()).collect::<Vec<_>>(),
+            vec![("t1".to_string(), "t3".to_string())]);
+        assert!(spills.is_empty());
     }
 }

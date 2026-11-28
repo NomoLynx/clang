@@ -13,11 +13,35 @@ use crate::languages::clang::traits::{gen_add_offset, ASTItemTrait};
 use crate::languages::clang::CLangError;
 use crate::languages::operators::LangOperators;
 
-use super::{CodeGenContext, CodeSnippet};
+use super::{CodeGenContext, CodeSnippet, ScratchRegisters, VectorGroupSize};
 
 struct LoopCounter<'a> {
     symbol: &'a SymbolEntry,
     bound: i32,
+}
+
+#[derive(Clone, Copy)]
+enum ElementwiseOperation {
+    Add,
+    Subtract,
+}
+
+impl ElementwiseOperation {
+    fn instruction(self) -> &'static str {
+        match self {
+            Self::Add => "vadd.vv",
+            Self::Subtract => "vsub.vv",
+        }
+    }
+}
+
+struct ElementwiseKernel<'a> {
+    counters: Vec<LoopCounter<'a>>,
+    left: &'a SymbolEntry,
+    right: &'a SymbolEntry,
+    destination: &'a SymbolEntry,
+    elements: i32,
+    operation: ElementwiseOperation,
 }
 
 fn same_symbol(left: &SymbolEntry, right: &SymbolEntry) -> bool {
@@ -191,21 +215,19 @@ fn array_expression<'a>(
     }
 }
 
-fn matrix_access<'a>(
+fn array_access<'a>(
     expression: &'a Expression,
     suffixes: &'a [PostfixExpressionPart],
-    row: &LoopCounter<'_>,
-    column: &LoopCounter<'_>,
+    counters: &[LoopCounter<'_>],
 ) -> Option<&'a SymbolEntry> {
     let mut indices = Vec::new();
     let symbol = array_expression(expression, &mut indices)?;
     for suffix in suffixes {
         indices.push(index_variable(suffix)?);
     }
-    let [row_index, column_index] = indices.as_slice() else {
-        return None;
-    };
-    if !same_symbol(row_index, row.symbol) || !same_symbol(column_index, column.symbol) {
+    if indices.len() != counters.len()
+        || indices.iter().zip(counters).any(|(index, counter)| !same_symbol(index, counter.symbol))
+    {
         return None;
     }
 
@@ -213,12 +235,13 @@ fn matrix_access<'a>(
         return None;
     };
     if element.as_ref() != &CLangTypes::Int32
-        || dimensions.get_dimensions_values().as_slice() != [row.bound as usize, column.bound as usize]
+        || dimensions.get_dimensions_values().as_slice() != counters.iter()
+            .map(|counter| counter.bound as usize).collect::<Vec<_>>().as_slice()
     {
         return None;
     }
 
-    // Scalar layout can pack arrays after bytes; global layout has no proven alignment.
+    // Only objects with checked FP-relative, word-aligned storage are eligible.
     match storage(symbol) {
         Some(SymbolLocation::Stack(offset)) if *offset % 4 == 0 => Some(symbol),
         _ => None,
@@ -239,103 +262,105 @@ fn emit_address(code: &mut String, symbol: &SymbolEntry, register: &str) -> Resu
         Some(SymbolLocation::Memory(label)) => {
             code.push_str(&format!("la {register}, {label}\n"));
         }
-        _ => return Err(CLangError::cannot_emit("RVV matrix add requires an addressable object")),
+        _ => return Err(CLangError::cannot_emit("RVV elementwise lowering requires an addressable object")),
     }
     Ok(())
 }
 
-pub(crate) fn generate_matrix_add(
-    outer: &IterationStatement_FOR,
-    context: &mut CodeGenContext,
-) -> Result<Option<CodeSnippet>, CLangError> {
-    let config = context.get_code_gen_config();
-    if !config.get_enable_rvv()
-        || !config.is_64bit_addressing()
-        || config.get_stack_space_size().is_some()
-    {
-        return Ok(None);
+fn match_kernel(outer: &IterationStatement_FOR) -> Option<ElementwiseKernel<'_>> {
+    let mut counters = Vec::new();
+    let mut current = outer;
+    let statement = loop {
+        let counter = loop_counter(current)?;
+        if counters.iter().any(|previous: &LoopCounter<'_>| same_symbol(previous.symbol, counter.symbol)) {
+            return None;
+        }
+        counters.push(counter);
+        if counters.len() > 3 {
+            return None;
+        }
+        match single_statement(&current.statement)? {
+            Statement::Iteration(_, IterationStatement::FOR(_, inner)) => current = inner,
+            Statement::Expression(_, statement) if counters.len() >= 2 => break statement,
+            _ => return None,
+        }
+    };
+    if statement.has_type_specifier() {
+        return None;
     }
-    let Some(Statement::Iteration(_, IterationStatement::FOR(_, inner))) =
-        single_statement(&outer.statement)
-    else {
-        return Ok(None);
-    };
-    let Some(Statement::Expression(_, statement)) = single_statement(&inner.statement) else {
-        return Ok(None);
-    };
-    let Some(row) = loop_counter(outer) else {
-        return Ok(None);
-    };
-    let Some(column) = loop_counter(inner) else {
-        return Ok(None);
-    };
-    if same_symbol(row.symbol, column.symbol) || statement.has_type_specifier() {
-        return Ok(None);
-    }
-    let Some(assignment) = single_assignment(statement.get_assignments()) else {
-        return Ok(None);
-    };
-    let Some(ConstantExpression::Tanry(_, destination)) = assignment_target(assignment) else {
-        return Ok(None);
+    let assignment = single_assignment(statement.get_assignments())?;
+    let ConstantExpression::Tanry(_, destination) = assignment_target(assignment)? else {
+        return None;
     };
     if destination.get_tanry_expression().is_tanry() {
-        return Ok(None);
+        return None;
     }
-    let Some(destination) = matrix_access(
+    let destination = array_access(
         destination.get_tanry_expression().get_expression(),
         destination.get_postfix_expression_parts(),
-        &row,
-        &column,
-    ) else {
-        return Ok(None);
+        &counters,
+    )?;
+    let Expression::Expression(_, operation) = plain_expression(assignment.get_constant_expr())? else {
+        return None;
     };
-    let Some(Expression::Expression(_, addition)) = plain_expression(assignment.get_constant_expr()) else {
-        return Ok(None);
+    let operation_kind = match operation.get_op() {
+        LangOperators::Add => ElementwiseOperation::Add,
+        LangOperators::Sub => ElementwiseOperation::Subtract,
+        _ => return None,
     };
-    if addition.get_op() != &LangOperators::Add {
-        return Ok(None);
-    }
-    let Some(left) = matrix_access(addition.get_left(), &[], &row, &column) else {
-        return Ok(None);
-    };
-    let Some(right) = matrix_access(addition.get_right(), &[], &row, &column) else {
-        return Ok(None);
-    };
+    let left = array_access(operation.get_left(), &[], &counters)?;
+    let right = array_access(operation.get_right(), &[], &counters)?;
     if same_symbol(destination, left) || same_symbol(destination, right) || same_symbol(left, right) {
-        return Ok(None);
+        return None;
     }
-    let Some(elements) = row.bound.checked_mul(column.bound).filter(|count| *count <= i32::MAX / 4) else {
-        return Ok(None);
-    };
+    let elements = counters.iter().try_fold(1i32, |count, counter| count.checked_mul(counter.bound))?;
+    if elements > i32::MAX / 4 {
+        return None;
+    }
+    Some(ElementwiseKernel { counters, left, right, destination, elements, operation: operation_kind })
+}
 
-    // The full, side-effect-free nest spans three distinct row-major objects.
-    let label = format!("__rvv_matrix_add_{}", context.attain_unique_id());
+fn emit_kernel(
+    kernel: &ElementwiseKernel<'_>,
+    bindings: &ScratchRegisters,
+    context: &mut CodeGenContext,
+) -> Result<CodeSnippet, CLangError> {
+    let [left_address, right_address, destination_address, remaining, vl_bytes] = bindings.integer.as_slice() else {
+        return Err(CLangError::cannot_emit("RVV kernel requires five owned integer temporaries"));
+    };
+    let [left_vector, right_vector, result_vector] = bindings.vector.as_slice() else {
+        return Err(CLangError::cannot_emit("RVV kernel requires three owned vector groups"));
+    };
+    debug_assert!(!bindings.registers().has_conflict(context.get_live_registers()));
+    let (left_vector, right_vector, result_vector) = (left_vector.name(), right_vector.name(), result_vector.name());
+    let instruction = kernel.operation.instruction();
+    let elements = kernel.elements;
+    let label = format!("__rvv_elementwise_{}", context.attain_unique_id());
     let mut code = String::from(".text\n.option arch, +v\n");
-    emit_address(&mut code, left, "t0")?;
-    emit_address(&mut code, right, "t1")?;
-    emit_address(&mut code, destination, "t2")?;
+    emit_address(&mut code, kernel.left, left_address)?;
+    emit_address(&mut code, kernel.right, right_address)?;
+    emit_address(&mut code, kernel.destination, destination_address)?;
     code.push_str(&format!(
-        "li t3, {elements}\n{label}:\n\
-         vsetvli t4, t3, e32, m1, ta, ma\n\
-         vle32.v v8, (t0)\n\
-         vle32.v v9, (t1)\n\
-         vadd.vv v10, v8, v9\n\
-         vse32.v v10, (t2)\n\
-         sub t3, t3, t4\n\
-         slli t4, t4, 2\n\
-         add t0, t0, t4\n\
-         add t1, t1, t4\n\
-         add t2, t2, t4\n\
-         bne t3, zero, {label}\n"
+        "li {remaining}, {elements}\n{label}:\n\
+         vsetvli {vl_bytes}, {remaining}, e32, m1, ta, ma\n\
+         vle32.v {left_vector}, ({left_address})\n\
+         vle32.v {right_vector}, ({right_address})\n\
+         {instruction} {result_vector}, {left_vector}, {right_vector}\n\
+         vse32.v {result_vector}, ({destination_address})\n\
+         sub {remaining}, {remaining}, {vl_bytes}\n\
+         slli {vl_bytes}, {vl_bytes}, 2\n\
+         add {left_address}, {left_address}, {vl_bytes}\n\
+         add {right_address}, {right_address}, {vl_bytes}\n\
+         add {destination_address}, {destination_address}, {vl_bytes}\n\
+         bne {remaining}, zero, {label}\n"
     ));
 
     let mut register_updates = String::new();
-    let mut clobbers = (0..5).map(|index| format!("t{index}")).collect::<Vec<_>>();
-    clobbers.extend(["v8", "v9", "v10"].iter().map(|name| name.to_string()));
-    for counter in [&row, &column] {
+    let mut clobbers = Vec::new();
+    for counter in &kernel.counters {
         if counter.symbol.is_global_variable() {
-            emit_address(&mut code, counter.symbol, "t4")?;
-            code.push_str(&format!("li t3, {}\nsw t3, 0(t4)\n", counter.bound));
+            emit_address(&mut code, counter.symbol, vl_bytes)?;
+            code.push_str(&format!("li {remaining}, {}\nsw {remaining}, 0({vl_bytes})\n", counter.bound));
             continue;
         }
 
@@ -345,19 +370,53 @@ pub(crate) fn generate_matrix_add(
                 clobbers.push(register.clone());
             }
             Some(SymbolLocation::Stack(_) | SymbolLocation::Memory(_)) => {
-                emit_address(&mut code, counter.symbol, "t4")?;
-                code.push_str(&format!("li t3, {}\nsw t3, 0(t4)\n", counter.bound));
+                emit_address(&mut code, counter.symbol, vl_bytes)?;
+                code.push_str(&format!("li {remaining}, {}\nsw {remaining}, 0({vl_bytes})\n", counter.bound));
             }
-            _ => return Err(CLangError::cannot_emit("RVV matrix add lost its induction variable storage")),
+            _ => return Err(CLangError::cannot_emit("RVV elementwise lowering lost its induction variable storage")),
         }
     }
     code.push_str(&register_updates);
 
-    let mut snippet = CodeSnippet::from_asm_code_str("rvv_matrix_add", &code)?;
+    let mut snippet = CodeSnippet::from_asm_code_str("rvv_elementwise", &code)?;
+    snippet.set_temp_register_names(bindings.registers().get_register_alias_name());
     snippet.set_impacted_regs(clobbers);
     snippet.set_input_register_names(vec!["fp".to_string()]);
-    context.set_rvv_vectorized_loops(context.get_rvv_vectorized_loops() + 1);
-    Ok(Some(snippet))
+    Ok(snippet)
+}
+
+pub(crate) fn generate_elementwise(
+    outer: &IterationStatement_FOR,
+    context: &mut CodeGenContext,
+) -> Result<Option<CodeSnippet>, CLangError> {
+    let config = context.get_code_gen_config();
+    if !config.get_enable_rvv() || !config.is_64bit_addressing() || config.get_stack_space_size().is_some() {
+        return Ok(None);
+    }
+    let Some(kernel) = match_kernel(outer) else {
+        return Ok(None);
+    };
+    let function = outer.statement.get_ast_item().get_current_function()
+        .ok_or_else(|| CLangError::cannot_emit("RVV lowering requires a containing function"))?;
+    if function.get_all_clangitems().iter().any(|item| {
+        item.is_asmstatement() || item.get_statement()
+            .map_or(false, |statement| matches!(statement, Statement::AsmStatement(_, _)))
+    }) {
+        core_utils::debug::output_string("RVV scalar fallback: function has unmodelled inline-assembly effects".to_string());
+        return Ok(None);
+    }
+    if context.get_verified_frame_bytes().is_none() {
+        return Err(CLangError::cannot_emit("RVV lowering requires a verified function frame"));
+    }
+    let snippet = context.with_scratch_registers(5, 3, VectorGroupSize::M1,
+        |context, bindings| emit_kernel(&kernel, bindings, context))?;
+    if snippet.is_some() {
+        context.set_rvv_vectorized_loops(context.get_rvv_vectorized_loops().checked_add(1)
+            .ok_or_else(|| CLangError::cannot_emit("RVV lowering count overflow"))?);
+    } else {
+        core_utils::debug::output_string("RVV scalar fallback: insufficient non-live scratch registers".to_string());
+    }
+    Ok(snippet)
 }
 
 #[cfg(test)]
@@ -417,8 +476,160 @@ mod tests {
         for instruction in ["vsetvli", "vle32.v", "vadd.vv", "vse32.v", "slli"] {
             assert!(vector.contains(instruction), "missing {instruction}");
         }
-        assert!(vector.contains("__rvv_matrix_add_"));
+        assert!(vector.contains("__rvv_elementwise_"));
         assert!(vector.replace(' ', "").contains("e32,m1,ta,ma"));
+    }
+
+    #[test]
+    fn rvv_subtraction_uses_real_ordered_vector_subtract() {
+        let declarations = "int lhs[2][5]; int rhs[2][5]; int result[2][5];";
+        let body = "result[row][col] = lhs[row][col] - rhs[row][col];";
+        let (code, count) = compile(declarations, body, true);
+        assert_eq!(count, 1);
+        assert!(code.contains("vsub.vv v10, v8, v9"), "{code}");
+        assert!(!code.contains("vadd.vv"));
+        let (scalar, count) = compile(declarations, body, false);
+        assert_eq!(count, 0);
+        assert!(!scalar.contains("vsub.vv"));
+    }
+
+    #[test]
+    fn rvv_refuses_functions_with_unmodelled_inline_assembly() {
+        let source = matrix_source(
+            "int lhs[2][5]; int rhs[2][5]; int result[2][5];",
+            "result[row][col] = lhs[row][col] + rhs[row][col];",
+        ).replace("return row + col;", "__asm { .text\naddi t0, t0, 0\n }; return row + col;");
+        let (code, count) = compile_source(&source, true);
+        assert_eq!(count, 0);
+        assert!(!code.contains("vadd.vv"));
+    }
+
+    #[test]
+    fn rvv_three_dimensional_nests_flatten_all_elements_for_both_operations() {
+        for operation in ["+", "-"] {
+            let source = format!("
+                int main() {{
+                    int lhs[2][3][5]; int rhs[2][3][5]; int result[2][3][5];
+                    int i; int j; int k;
+                    for (i = 0; i < 2; i = i + 1) {{
+                        for (j = 0; j < 3; j = j + 1) {{
+                            for (k = 0; k < 5; k = k + 1) {{
+                                lhs[i][j][k] = 7; rhs[i][j][k] = 2;
+                            }}
+                        }}
+                    }}
+                    for (i = 0; i < 2; i = i + 1) {{
+                        for (j = 0; j < 3; j = j + 1) {{
+                            for (k = 0; k < 5; k = k + 1) {{
+                                result[i][j][k] = lhs[i][j][k] {operation} rhs[i][j][k];
+                            }}
+                        }}
+                    }}
+                    return 42;
+                }}");
+            let (ir, count) = compile_ir(&source, true, None);
+            assert_eq!(count, 1);
+            let kernel = matrix_snippet(&ir).expect("3D kernel");
+            let code = kernel.generate_code_string();
+            assert!(code.contains("li t3, 30"), "{code}");
+            assert!(code.contains(if operation == "+" { "vadd.vv" } else { "vsub.vv" }));
+            assert_eq!(kernel.get_impacted_regs().len(), 3, "all three index registers must be updated");
+        }
+    }
+
+    fn lower_with_live(live: &RegisterSet) -> Option<CodeSnippet> {
+        let source = matrix_source(
+            "int lhs[2][5]; int rhs[2][5]; int result[2][5];",
+            "result[row][col] = lhs[row][col] + rhs[row][col];",
+        );
+        let mut context = CodeGenContext::default();
+        context.set_symbol_table_md_file_name(None);
+        context.get_code_gen_config_mut().set_enable_rvv(true);
+        let mut program = parse_clang(&source, &mut context).unwrap();
+        parse_clang_2nd(&mut program, &mut context).unwrap();
+        let items = program.get_all_clangitems();
+        for item in &items {
+            let Some(outer) = item.get_for_loop() else {
+                continue;
+            };
+            if match_kernel(outer).is_none() {
+                continue;
+            }
+            let frame = outer.statement.get_ast_item().get_current_function().unwrap()
+                .checked_frame_size(&context).unwrap();
+            let result = context.with_verified_frame(frame, |context| {
+                context.with_live_registers(live, |context| generate_elementwise(outer, context))
+            }).unwrap();
+            assert!(context.get_reserved_registers().is_empty());
+            return result;
+        }
+        panic!("regression did not contain a canonical matrix nest");
+    }
+
+    #[test]
+    fn rvv_bindings_avoid_live_gprs_vectors_and_decline_on_exhaustion() {
+        let live = RegisterSet::from("t0, t1, v8");
+        let kernel = lower_with_live(&live).expect("five alternative GPRs are available");
+        assert!(!kernel.get_temp_register_as_registerset().has_conflict(&live));
+        let code = kernel.generate_code_string();
+        assert!(code.contains("vle32.v v9, (t2)"), "{code}");
+        assert!(!code.contains("vsub.vv"));
+        assert!(code.contains("vadd.vv v11, v9, v10"), "{code}");
+        assert!(lower_with_live(&RegisterSet::from("t0, t1, t2")).is_none());
+    }
+
+    #[test]
+    fn complete_frame_covers_nested_storage_and_alignment_padding() {
+        let source = "
+            int main() {
+                char pad[3]; int lhs[2][5]; int rhs[2][5]; int result[2][5];
+                pad[0] = 1;
+                { int nested[8]; nested[0] = 2; }
+                return 42;
+            }";
+        let (code, _) = compile_source(source, false);
+        assert!(code.contains("addi sp, sp, -160"), "nested slots below the old 128-byte reservation must be covered: {code}");
+    }
+
+    #[test]
+    fn large_in_place_offsets_preserve_sp_and_unsupported_frames_are_rejected() {
+        let source = "
+            int f() { return 1; }
+            int main() {
+                int result;
+                { int big[600]; big[0] = 41; result = big[0]; }
+                return result + f();
+            }";
+        let mut context = CodeGenContext::default();
+        context.set_symbol_table_md_file_name(None);
+        let mut program = parse_clang(source, &mut context).unwrap();
+        parse_clang_2nd(&mut program, &mut context).unwrap();
+        let error = program.generate_code(&mut context).expect_err("wide scalar FP offsets are unsupported");
+        assert!(error.to_string().contains("2048 bytes"));
+        let allocate = gen_add_offset("sp", "x2", -2400);
+        assert!(allocate.contains("addi sp, sp, -2048"));
+        assert!(allocate.contains("addi sp, sp, -352"));
+        assert!(!allocate.contains("lui"));
+        let deallocate = gen_add_offset("x2", "sp", 4096);
+        assert!(!deallocate.contains("lui"));
+        for line in deallocate.lines() {
+            let chunk = line.rsplit(',').next().unwrap().trim().parse::<i32>().unwrap();
+            assert_eq!(chunk % 16, 0, "SP must remain aligned at each chunk");
+            assert!((-2048..=2047).contains(&chunk));
+        }
+    }
+
+    #[test]
+    fn frame_verification_rejects_offsets_outside_the_recorded_frame() {
+        let mut context = CodeGenContext::default();
+        context.set_symbol_table_md_file_name(None);
+        let mut program = parse_clang("int main() { int data[4]; data[0] = 1; return 42; }", &mut context).unwrap();
+        parse_clang_2nd(&mut program, &mut context).unwrap();
+        let items = program.get_all_clangitems();
+        let function = items.iter().find_map(|item| item.get_function_definition()).unwrap();
+        assert_eq!(function.checked_frame_size(&context).unwrap(), 16);
+        function.set_stack_frame_pointer(0);
+        assert!(function.checked_frame_size(&context).is_err());
     }
 
     #[test]
@@ -426,7 +637,7 @@ mod tests {
         let declarations = "int lhs[2][5]; int rhs[2][5]; int result[2][5];";
         for body in [
             "lhs[row][col] = lhs[row][col] + rhs[row][col];",
-            "result[row][col] = lhs[row][col] - rhs[row][col];",
+            "result[row][col] = lhs[row][col] * rhs[row][col];",
             "result[row][col] = lhs[row][col] + rhs[row][col]; rhs[row][col] = 3;",
         ] {
             let (code, count) = compile(declarations, body, true);
@@ -448,15 +659,15 @@ mod tests {
     }
 
     #[test]
-    fn rvv_matrix_add_refuses_unproven_alignment() {
+    fn rvv_stack_layout_aligns_arrays_and_refuses_unproven_storage() {
         let body = "result[row][col] = lhs[row][col] + rhs[row][col];";
         let (code, count) = compile(
             "char pad[3]; int lhs[2][5]; int rhs[2][5]; int result[2][5];",
             body,
             true,
         );
-        assert_eq!(count, 0);
-        assert!(!code.contains("vadd.vv"));
+        assert_eq!(count, 1);
+        assert!(code.contains("vadd.vv"));
 
         let source = "
             int lhs[2][5]; int rhs[2][5]; int result[2][5];
@@ -483,7 +694,7 @@ mod tests {
     }
 
     fn matrix_snippet(code: &CodeSnippet) -> Option<&CodeSnippet> {
-        if code.get_name() == "rvv_matrix_add" {
+        if code.get_name() == "rvv_elementwise" {
             return Some(code);
         }
         code.get_code_items().into_iter().find_map(|item| match item {

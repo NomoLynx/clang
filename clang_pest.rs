@@ -84,7 +84,7 @@ pub (crate) fn parse_clang_2nd(prog:&mut CLangProgram, context:&mut CodeGenConte
     prog.enrich_symbol_table(context);
 
     // assign registers
-    prog.assign_registers(context);
+    prog.assign_registers(context)?;
 
     // Persist symbol tables after storage locations are assigned.
     context.write_symbol_table_md_file(prog);

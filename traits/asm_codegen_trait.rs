@@ -487,6 +487,8 @@ impl AsmCodeGenTrait for Declaration {
 
 impl AsmCodeGenTrait for FunctionDefinition {
     fn generate_code(&self, context:&mut CodeGenContext) -> Result<(), CLangError> {
+        let frame_bytes = self.checked_frame_size(context)?;
+        context.with_verified_frame(frame_bytes, |context| {
         let function_body_label = "__function__body";
         let parameter_label = "__parameters__to__stack";
         let function_end_label = "__function_body_end";
@@ -568,6 +570,7 @@ impl AsmCodeGenTrait for FunctionDefinition {
         }
 
         Ok(())
+        })
     }
 }
 
@@ -577,13 +580,13 @@ impl AsmCodeGenTrait for CompoundStatement {
         let mut r = context.get_code("compound_template", ast_item)?;
         
         // set the local variable stack size
-        let var_size = self.get_symbol_table().get_var_symbol_total_size_in_bytes(context);
+        let var_size = context.get_verified_frame_bytes().copied()
+            .ok_or_else(|| CLangError::cannot_emit("Function body requires a verified frame layout"))?;
         if var_size > 0 {
-            // round up to 16 bytes alignment
-            let aligned_size = round_up_to_16(var_size) as isize;
+            let aligned_size = var_size as isize;
             let allocate_code = gen_add_offset("sp", "sp", -aligned_size);
             let mut stack_allocation_code = CodeSnippet::from_asm_code_str("allocate stack pointer", &allocate_code)?;
-            stack_allocation_code.set_debug_info(&format!("allocate {aligned_size} bytes for local variables in compound statement({})", self.get_ast_item().get_sequence_id()));
+            stack_allocation_code.set_debug_info(&format!("allocate {aligned_size} bytes for complete function frame, including nested slots ({})", self.get_ast_item().get_sequence_id()));
             r.add_snippet(stack_allocation_code);
         }
 
@@ -641,7 +644,7 @@ impl AsmCodeGenTrait for Statement {
                         const_code.set_name("case_const_code");
                         const_code.move_register_from(template.get_all_registers(), [].into(), context)?;
                         template.get_input_register_from(0, &const_code, 0, context)?;
-                        expr.generate_code(context)?;
+                        context.with_live_registers(&template.get_all_registers(), |context| expr.generate_code(context))?;
                         let mut statements = context.get_code_snippet().clone();
                         statements.set_name("case_statements");
                         statements.move_register_from(template.get_all_registers(), [].into(), context)?;
@@ -671,7 +674,7 @@ impl AsmCodeGenTrait for Statement {
             Statement::Iteration(_, n) => {
                 match n {
                     IterationStatement::FOR(_, n) => {
-                        if let Some(code) = rvv_matrix_add::generate_matrix_add(n, context)? {
+                        if let Some(code) = rvv_elementwise::generate_elementwise(n, context)? {
                             context.set_code_snippet(code);
                             return Ok(());
                         }
@@ -1436,7 +1439,7 @@ impl AsmCodeGenTrait for Expression {
                         let array_type = n.get_index_operand_type();
                         let assignments = postfix.get_clang_expression().unwrap();
                         assert!(array_code.get_output_register_names().len() == 1, "arraycode output register should be 1, but got {}", array_code.get_output_register_names().len());
-                        let live_base_regs = array_code.get_output_register_as_registerset();
+                        let live_base_regs = array_code.live_outputs_with(context.get_live_registers());
                         let mut code = generate_array_access_asm_code2(self.get_ast_item(), 
                                 &array_type, 
                                 array_code.get_output_register_names().first().unwrap(), 

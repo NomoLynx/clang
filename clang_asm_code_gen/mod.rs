@@ -8,7 +8,7 @@ pub (crate) mod markdowndata;
 pub(crate) mod codesnippet_data_item;
 pub(crate) mod snippet_key;
 pub(crate) mod register_usage;
-pub(crate) mod rvv_matrix_add;
+pub(crate) mod rvv_elementwise;
 
 pub use code_gen_context::*;
 pub use code_gen_configuration::*;

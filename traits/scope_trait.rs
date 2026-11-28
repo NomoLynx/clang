@@ -2,6 +2,7 @@ use super::*;
 use crate::languages::clang::clang_asm_code_gen::CodeGenContext;
 use crate::languages::clang::{ast_item::ASTItem, clang_item::CLangItem, clang_program::CLangProgram, compound_statement::CompoundStatement, function_definition::FunctionDefinition};
 use crate::languages::clang::symbol_table::*;
+use crate::languages::clang::CLangError;
 
 pub trait ScopeTrait {
     fn get_scope_ast_item(&self) -> &ASTItem;
@@ -25,13 +26,14 @@ pub trait ScopeTrait {
         }
     }
 
-    fn assgin_var_register(&mut self, context:&mut CodeGenContext) {
+    fn assgin_var_register(&mut self, context:&mut CodeGenContext) -> Result<(), CLangError> {
         let symbol_table = self.get_symbol_table_mut();
-        symbol_table.assgin_var_register(context);
+        symbol_table.assgin_var_register(context)
     }
 
-    fn assign_parameter_register(&mut self, _context:&mut CodeGenContext) { 
+    fn assign_parameter_register(&mut self, _context:&mut CodeGenContext) -> Result<(), CLangError> {
         // default implementation does nothing
+        Ok(())
     }
 }
 
@@ -78,10 +80,9 @@ impl ScopeTrait for FunctionDefinition {
         self.get_symbol_table_mut()
     }
 
-    fn assign_parameter_register(&mut self, context:&mut CodeGenContext) {
-        let n = self.update_symbol_offset(context.get_parameter_register_number(), 
-                    context.get_code_gen_config().get_addressing_in_bytes());
-        n.unwrap()
+    fn assign_parameter_register(&mut self, context:&mut CodeGenContext) -> Result<(), CLangError> {
+        self.update_symbol_offset(context.get_parameter_register_number(),
+                    context.get_code_gen_config().get_addressing_in_bytes())
     }
 }
 

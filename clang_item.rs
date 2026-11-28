@@ -950,6 +950,13 @@ impl CLangItem {
         }
     }
 
+    pub fn get_statement(&self) -> Option<&mut Statement> {
+        match self.clone() {
+            Self::Statement(statement) => Some(Self::from_raw(statement)),
+            _ => None,
+        }
+    }
+
     pub fn get_compound_statement(&self) -> Option<&mut CompoundStatement> {
         match self.clone() {
             Self::CompoundStatement(n) => Some(Self::from_raw(n)),
